@@ -1,3 +1,7 @@
+// Enforce memory safety: no unsafe code allowed in this crate
+// (dependencies may still use unsafe code, but our code cannot)
+#![forbid(unsafe_code)]
+
 use anyhow::{anyhow, Result};
 use axum::{
     body::Body,
@@ -334,3 +338,4 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
