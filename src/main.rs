@@ -13,7 +13,7 @@ use log::{debug, error, info, warn};
 use rand::prelude::*;
 use rusty_paseto::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio_util::io::ReaderStream;
 
@@ -87,7 +87,7 @@ async fn load_config() -> Result<Config> {
 
 async fn generate_token(
     config: &Config,
-    file_path: &PathBuf,
+    file_path: &Path,
     expires_in_seconds: u64,
 ) -> Result<String> {
     // Verify the file exists
