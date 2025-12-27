@@ -73,15 +73,8 @@ jobs:
           echo "Extracted version: $VERSION"
 
       - name: Build Docker image (test only)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          platforms: linux/amd64
-          push: false
-          load: true
-          tags: ryansend:${{ steps.version.outputs.version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        run: |
+          docker build -t ryansend:${{ steps.version.outputs.version }} .
 
       - name: Test Docker image
         run: |
