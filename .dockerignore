@@ -1,0 +1,42 @@
+# Rust build artifacts
+target/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+README.md
+*.md
+
+# Test files
+test.txt
+/tmp/
+
+# Config files (will be generated at runtime)
+config.yaml
+
+# Docker files
+Dockerfile
+.dockerignore
+
+# CI/CD
+.github/
+
+# Logs
+*.log
+
+# Environment files
+.env
+.env.local

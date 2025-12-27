@@ -1,0 +1,6 @@
+/target
+
+# Configuration file containing secrets
+config.yaml
+
+.DS_Store
