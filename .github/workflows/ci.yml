@@ -78,6 +78,7 @@ jobs:
           context: .
           platforms: linux/amd64
           push: false
+          load: true
           tags: ryansend:${{ steps.version.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
