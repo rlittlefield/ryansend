@@ -1,0 +1,110 @@
+name: Build and Publish Docker Image
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: ryansend
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep -E '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Extracted version: $VERSION"
+
+      - name: Extract tag version (if triggered by tag)
+        id: tag_version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG_VERSION=${GITHUB_REF#refs/tags/v}
+          echo "tag_version=$TAG_VERSION" >> $GITHUB_OUTPUT
+          echo "Tag version: $TAG_VERSION"
+
+      - name: Verify version consistency
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          CARGO_VERSION="${{ steps.version.outputs.version }}"
+          TAG_VERSION="${{ steps.tag_version.outputs.tag_version }}"
+          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+            echo "ERROR: Cargo.toml version ($CARGO_VERSION) does not match tag version ($TAG_VERSION)"
+            exit 1
+          fi
+          echo "✅ Version consistency verified: $CARGO_VERSION"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Tag with version from Cargo.toml
+            type=raw,value=${{ steps.version.outputs.version }}
+            # Tag with 'latest' for main releases
+            type=raw,value=latest,enable={{is_default_branch}}
+            # Tag with git tag (without 'v' prefix)
+            type=ref,event=tag,prefix=
+            # Tag with branch name for non-tag pushes
+            type=ref,event=branch
+          labels: |
+            org.opencontainers.image.title=ryansend
+            org.opencontainers.image.description=A secure file sharing tool using PASETO tokens
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.vendor=ryansend
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate summary
+        run: |
+          echo "## 🚀 Docker Image Published Successfully" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Published Images:**" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Pull Commands:**" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "# Latest version" >> $GITHUB_STEP_SUMMARY
+          echo "docker pull ${{ secrets.DOCKER_USERNAME }}/ryansend:${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Latest (if main branch)" >> $GITHUB_STEP_SUMMARY
+          echo "docker pull ${{ secrets.DOCKER_USERNAME }}/ryansend:latest" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
