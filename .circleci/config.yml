@@ -6,6 +6,24 @@ orbs:
 
 # Define custom commands for reusability
 commands:
+  restore_cargo_cache:
+    description: "Restore Cargo cache"
+    steps:
+      - restore_cache:
+          keys:
+            - cargo-cache-v2-{{ arch }}-{{ checksum "Cargo.lock" }}
+            - cargo-cache-v2-{{ arch }}-
+
+  save_cargo_cache:
+    description: "Save Cargo cache"
+    steps:
+      - save_cache:
+          key: cargo-cache-v2-{{ arch }}-{{ checksum "Cargo.lock" }}
+          paths:
+            - ~/.cargo/registry
+            - ~/.cargo/git
+            - target
+
   extract_version:
     description: "Extract version from Cargo.toml"
     steps:
@@ -44,7 +62,7 @@ jobs:
           name: Install Rust components
           command: |
             rustup component add clippy rustfmt
-      - rust/restore_cache
+      - restore_cargo_cache
       - run:
           name: Check formatting
           command: cargo fmt --all -- --check
@@ -68,7 +86,7 @@ jobs:
           name: Build release
           command: cargo build --release --verbose
 
-      - rust/save_cache
+      - save_cargo_cache
 
   docker-build-test:
     docker:
