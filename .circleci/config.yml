@@ -39,10 +39,12 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - checkout
-      - rust/install:
-          components: clippy,rustfmt
+      - rust/install
+      - run:
+          name: Install Rust components
+          command: |
+            rustup component add clippy rustfmt
       - rust/restore_cache
-
       - run:
           name: Check formatting
           command: cargo fmt --all -- --check
