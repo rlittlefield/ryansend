@@ -123,6 +123,7 @@ jobs:
   build-and-push-docker:
     docker:
       - image: cimg/base:current
+    resource_class: large
     steps:
       - checkout
       - setup_remote_docker:
