@@ -1,0 +1,287 @@
+version: 2.1
+
+# Import orbs
+orbs:
+  rust: circleci/rust@1.8.0
+
+# Define custom commands for reusability
+commands:
+  extract_version:
+    description: "Extract version from Cargo.toml"
+    steps:
+      - run:
+          name: Extract version from Cargo.toml
+          command: |
+            VERSION=$(grep -E '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+            echo "export CARGO_VERSION=$VERSION" >> $BASH_ENV
+            echo "Extracted version: $VERSION"
+
+  install_audit_tools:
+    description: "Install security audit tools"
+    steps:
+      - run:
+          name: Install cargo-audit and cargo-deny
+          command: |
+            if ! command -v cargo-audit &> /dev/null; then
+              cargo install cargo-audit
+            fi
+            if ! command -v cargo-deny &> /dev/null; then
+              cargo install --locked cargo-deny
+            fi
+
+# Define jobs
+jobs:
+  test:
+    executor:
+      name: rust/default
+      tag: "1.92.0"
+    environment:
+      CARGO_TERM_COLOR: always
+    steps:
+      - checkout
+      - rust/install:
+          components: clippy,rustfmt
+      - rust/restore_cache
+
+      - run:
+          name: Check formatting
+          command: cargo fmt --all -- --check
+
+      - run:
+          name: Run clippy
+          command: cargo clippy --all-targets --all-features -- -D warnings
+
+      - run:
+          name: Check for unsafe code (clippy)
+          command: |
+            cargo clippy --all-targets --all-features -- \
+              -D clippy::undocumented_unsafe_blocks \
+              -D clippy::multiple_unsafe_ops_per_block
+
+      - run:
+          name: Run tests
+          command: cargo test --verbose
+
+      - run:
+          name: Build release
+          command: cargo build --release --verbose
+
+      - rust/save_cache
+
+  docker-build-test:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - extract_version
+
+      - run:
+          name: Build Docker image (test only)
+          command: |
+            docker build -t ryansend:${CARGO_VERSION} .
+            echo "Successfully built Docker image ryansend:${CARGO_VERSION}"
+
+  security-audit:
+    executor:
+      name: rust/default
+      tag: "1.92.0"
+    steps:
+      - checkout
+      - rust/install
+      - install_audit_tools
+
+      - run:
+          name: Run security audit
+          command: cargo audit
+
+      - run:
+          name: Run cargo deny
+          command: cargo deny check
+
+  build-and-push-docker:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - extract_version
+
+      - run:
+          name: Extract tag version (if triggered by tag)
+          command: |
+            if [[ "$CIRCLE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              TAG_VERSION=${CIRCLE_TAG#v}
+              echo "export TAG_VERSION=$TAG_VERSION" >> $BASH_ENV
+              echo "Tag version: $TAG_VERSION"
+            fi
+
+      - run:
+          name: Verify version consistency
+          command: |
+            if [ ! -z "$TAG_VERSION" ]; then
+              if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+                echo "ERROR: Cargo.toml version ($CARGO_VERSION) does not match tag version ($TAG_VERSION)"
+                exit 1
+              fi
+              echo "✅ Version consistency verified: $CARGO_VERSION"
+            fi
+
+      - run:
+          name: Login to Docker Hub
+          command: |
+            echo $DOCKER_TOKEN | docker login -u $DOCKER_USERNAME --password-stdin
+
+      - run:
+          name: Setup Docker Buildx
+          command: |
+            # Enable experimental features and setup buildx
+            export DOCKER_CLI_EXPERIMENTAL=enabled
+            docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+            docker buildx create --name mybuilder --driver docker-container --use
+            docker buildx inspect --bootstrap
+
+      - run:
+          name: Build and push multi-architecture Docker image
+          command: |
+            # Determine tags
+            TAGS=""
+
+            # Always tag with Cargo.toml version
+            TAGS="$TAGS -t $DOCKER_USERNAME/ryansend:$CARGO_VERSION"
+
+            # Tag with latest if on main branch
+            if [ "$CIRCLE_BRANCH" = "main" ]; then
+              TAGS="$TAGS -t $DOCKER_USERNAME/ryansend:latest"
+            fi
+
+            # Tag with git tag if triggered by tag
+            if [ ! -z "$CIRCLE_TAG" ]; then
+              TAG_WITHOUT_V=${CIRCLE_TAG#v}
+              TAGS="$TAGS -t $DOCKER_USERNAME/ryansend:$TAG_WITHOUT_V"
+            fi
+
+            # Tag with branch name for non-tag pushes (sanitized)
+            if [ -z "$CIRCLE_TAG" ] && [ ! -z "$CIRCLE_BRANCH" ]; then
+              # Sanitize branch name for Docker tag (replace / with -)
+              SAFE_BRANCH=$(echo "$CIRCLE_BRANCH" | sed 's/\//-/g')
+              TAGS="$TAGS -t $DOCKER_USERNAME/ryansend:$SAFE_BRANCH"
+            fi
+
+            # Build and push
+            docker buildx build \
+              --platform linux/amd64,linux/arm64 \
+              --push \
+              $TAGS \
+              --label "org.opencontainers.image.title=ryansend" \
+              --label "org.opencontainers.image.description=A secure file sharing tool using PASETO tokens" \
+              --label "org.opencontainers.image.version=$CARGO_VERSION" \
+              --label "org.opencontainers.image.vendor=ryansend" \
+              --label "org.opencontainers.image.source=https://github.com/$CIRCLE_PROJECT_USERNAME/$CIRCLE_PROJECT_REPONAME" \
+              --label "org.opencontainers.image.revision=$CIRCLE_SHA1" \
+              --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              .
+
+      - run:
+          name: Generate summary
+          command: |
+            echo "## 🚀 Docker Image Published Successfully"
+            echo ""
+            echo "**Version:** $CARGO_VERSION"
+            echo "**Git SHA:** $CIRCLE_SHA1"
+            echo ""
+            echo "**Published Images:**"
+            echo "- $DOCKER_USERNAME/ryansend:$CARGO_VERSION"
+            if [ "$CIRCLE_BRANCH" = "main" ]; then
+              echo "- $DOCKER_USERNAME/ryansend:latest"
+            fi
+            if [ ! -z "$CIRCLE_TAG" ]; then
+              TAG_WITHOUT_V=${CIRCLE_TAG#v}
+              echo "- $DOCKER_USERNAME/ryansend:$TAG_WITHOUT_V"
+            fi
+            if [ -z "$CIRCLE_TAG" ] && [ ! -z "$CIRCLE_BRANCH" ]; then
+              SAFE_BRANCH=$(echo "$CIRCLE_BRANCH" | sed 's/\//-/g')
+              echo "- $DOCKER_USERNAME/ryansend:$SAFE_BRANCH"
+            fi
+            echo ""
+            echo "**Pull Commands:**"
+            echo '```bash'
+            echo "docker pull $DOCKER_USERNAME/ryansend:$CARGO_VERSION"
+            if [ "$CIRCLE_BRANCH" = "main" ]; then
+              echo "docker pull $DOCKER_USERNAME/ryansend:latest"
+            fi
+            echo '```'
+
+# Define workflows
+workflows:
+  version: 2
+
+  # Main CI workflow (runs on PRs and pushes to main/develop)
+  ci:
+    jobs:
+      - test:
+          filters:
+            branches:
+              only:
+                - main
+                - develop
+                - /^feature\/.*/
+                - /^hotfix\/.*/
+            tags:
+              ignore: /.*/
+
+      - docker-build-test:
+          requires:
+            - test
+          filters:
+            branches:
+              only:
+                - main
+                - develop
+            tags:
+              ignore: /.*/
+
+      - security-audit:
+          filters:
+            branches:
+              only:
+                - main
+                - develop
+            tags:
+              ignore: /.*/
+
+  # Docker publish workflow (runs on version tags)
+  docker-publish:
+    jobs:
+      - build-and-push-docker:
+          context:
+            - docker-hub-creds
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /^v\d+\.\d+\.\d+$/
+
+  # Manual workflow for development branches
+  manual-build:
+    jobs:
+      - hold-for-approval:
+          type: approval
+          filters:
+            branches:
+              only:
+                - main
+                - develop
+
+      - build-and-push-docker:
+          context:
+            - docker-hub-creds
+          requires:
+            - hold-for-approval
+          filters:
+            branches:
+              only:
+                - main
+                - develop
