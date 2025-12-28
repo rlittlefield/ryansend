@@ -270,11 +270,16 @@ jobs:
             echo $DOCKER_TOKEN | docker login -u $DOCKER_USERNAME --password-stdin
 
       - run:
-          name: Setup Docker Buildx
+          name: Setup Docker Buildx (ARM64)
           command: |
             # Enable experimental features and setup buildx
             export DOCKER_CLI_EXPERIMENTAL=enabled
-            docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+
+            # Install QEMU for ARM64 host
+            sudo apt-get update
+            sudo apt-get install -y qemu-user-static binfmt-support
+            docker run --rm --privileged tonistiigi/binfmt --install all
+
             docker buildx create --name mybuilder --driver docker-container --use
             docker buildx inspect --bootstrap
 
