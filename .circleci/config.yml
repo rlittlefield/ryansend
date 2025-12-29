@@ -307,14 +307,3 @@ workflows:
               only:
                 - main
                 - develop
-
-      - build-and-push-docker-arm:
-          context:
-            - docker-hub-creds
-          requires:
-            - hold-for-approval
-          filters:
-            branches:
-              only:
-                - main
-                - develop
