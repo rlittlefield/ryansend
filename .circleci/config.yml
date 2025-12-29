@@ -34,18 +34,59 @@ commands:
             echo "export CARGO_VERSION=$VERSION" >> $BASH_ENV
             echo "Extracted version: $VERSION"
 
-  install_audit_tools:
-    description: "Install security audit tools"
+  restore_audit_tools_cache:
+    description: "Restore security audit tools cache"
     steps:
+      - restore_cache:
+          keys:
+            - audit-tools-v1-{{ arch }}
+            - audit-tools-v1-
+
+  save_audit_tools_cache:
+    description: "Save security audit tools cache"
+    steps:
+      - save_cache:
+          key: audit-tools-v1-{{ arch }}
+          paths:
+            - ~/.cargo/bin/cargo-audit
+            - ~/.cargo/bin/cargo-deny
+
+  restore_audit_db_cache:
+    description: "Restore cargo-audit vulnerability database cache"
+    steps:
+      - restore_cache:
+          keys:
+            - audit-db-v1-{{ epoch }}
+            - audit-db-v1-
+
+  save_audit_db_cache:
+    description: "Save cargo-audit vulnerability database cache"
+    steps:
+      - save_cache:
+          key: audit-db-v1-{{ epoch }}
+          paths:
+            - ~/.cargo/advisory-db
+
+  install_audit_tools:
+    description: "Install security audit tools with caching"
+    steps:
+      - restore_audit_tools_cache
       - run:
           name: Install cargo-audit and cargo-deny
           command: |
             if ! command -v cargo-audit &> /dev/null; then
+              echo "Installing cargo-audit..."
               cargo install cargo-audit
+            else
+              echo "cargo-audit already installed (from cache)"
             fi
             if ! command -v cargo-deny &> /dev/null; then
+              echo "Installing cargo-deny..."
               cargo install --locked cargo-deny
+            else
+              echo "cargo-deny already installed (from cache)"
             fi
+      - save_audit_tools_cache
 
 # Define jobs
 jobs:
@@ -111,14 +152,21 @@ jobs:
       - checkout
       - rust/install
       - install_audit_tools
+      - restore_audit_db_cache
 
       - run:
           name: Run security audit
-          command: cargo audit
+          command: |
+            echo "Running cargo audit..."
+            cargo audit --color always
 
       - run:
           name: Run cargo deny
-          command: cargo deny check
+          command: |
+            echo "Running cargo deny..."
+            cargo deny check --color always
+
+      - save_audit_db_cache
 
   build-and-push-docker:
     docker:
