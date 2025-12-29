@@ -158,13 +158,13 @@ jobs:
           name: Run security audit
           command: |
             echo "Running cargo audit..."
-            cargo audit --color always
+            cargo audit
 
       - run:
           name: Run cargo deny
           command: |
             echo "Running cargo deny..."
-            cargo deny check --color always
+            cargo deny check
 
       - save_audit_db_cache
 
