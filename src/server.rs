@@ -29,6 +29,12 @@ use crate::tls::{self, ChallengeStore};
 use crate::tunnel::{TunnelFileInfo, TunnelManager};
 use crate::ReloadSignal;
 
+use walkdir::WalkDir;
+
+use async_zip::tokio::write::ZipFileWriter;
+use async_zip::{Compression, ZipEntryBuilder};
+use futures::AsyncWriteExt as FuturesAsyncWriteExt;
+
 #[derive(Debug, Clone)]
 struct ByteRange {
     start: u64,
@@ -311,6 +317,136 @@ pub async fn tunnel_upload_handler(
         .map_err(|e| anyhow::anyhow!("Failed to build response: {}", e))?)
 }
 
+const CHUNK_SIZE: usize = 64 * 1024;
+
+async fn stream_directory_as_zip(
+    path: PathBuf,
+    claims: &crate::auth::TokenClaims,
+) -> AppResult<Response> {
+    if !path.exists() {
+        return Err(AppError::not_found(anyhow!("Directory not found")));
+    }
+    if !path.is_dir() {
+        return Err(AppError::not_found(anyhow!("Not a directory")));
+    }
+
+    let dir_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("archive")
+        .to_owned();
+
+    let zip_name = format!("{}.zip", dir_name);
+
+    let note_info = match &claims.note {
+        Some(note) => format!(" (note: \"{}\")", note),
+        None => String::new(),
+    };
+
+    info!(
+        "Directory ZIP started: '{}' from path: {} [token_id: {}]{}",
+        dir_name, claims.path, claims.id, note_info
+    );
+
+    // Collect entries (metadata only)
+    let mut entries: Vec<(PathBuf, String, bool)> = Vec::new();
+    for entry in WalkDir::new(&path) {
+        let entry = entry.map_err(|e| anyhow::anyhow!("WalkDir error: {}", e))?;
+
+        let rel = match entry.path().strip_prefix(&path) {
+            Ok(p) if !p.as_os_str().is_empty() => p.to_string_lossy().replace('\\', "/"),
+            _ => continue,
+        };
+
+        entries.push((entry.path().to_owned(), rel, entry.file_type().is_dir()));
+    }
+
+    let (writer_half, reader_half) = tokio::io::duplex(256 * 1024);
+
+    tokio::spawn(async move {
+        let mut zip = ZipFileWriter::with_tokio(writer_half);
+
+        for (full_path, rel_name, is_dir) in entries {
+            if is_dir {
+                let entry_name = format!("{}/", rel_name);
+                let builder = ZipEntryBuilder::new(entry_name.into(), Compression::Stored);
+
+                if let Err(e) = zip.write_entry_whole(builder, &[]).await {
+                    error!("ZIP dir error '{}': {}", rel_name, e);
+                    return;
+                }
+                continue;
+            }
+
+            let builder =
+                ZipEntryBuilder::new(rel_name.clone().into(), Compression::Deflate);
+
+            let mut entry_writer = match zip.write_entry_stream(builder).await {
+                Ok(w) => w,
+                Err(e) => {
+                    error!("ZIP entry open error '{}': {}", rel_name, e);
+                    return;
+                }
+            };
+
+            let mut file = match tokio::fs::File::open(&full_path).await {
+                Ok(f) => f,
+                Err(e) => {
+                    error!("Cannot open '{}': {}", full_path.display(), e);
+                    return;
+                }
+            };
+
+            let mut buf = vec![0u8; CHUNK_SIZE];
+
+            loop {
+                match file.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Err(e) = entry_writer.write_all(&buf[..n]).await {
+                            error!("ZIP write error '{}': {}", rel_name, e);
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Read error '{}': {}", full_path.display(), e);
+                        return;
+                    }
+                }
+            }
+
+            if let Err(e) = entry_writer.close().await {
+                error!("ZIP close error '{}': {}", rel_name, e);
+                return;
+            }
+        }
+
+        if let Err(e) = zip.close().await {
+            error!("ZIP finalization error: {}", e);
+        }
+    });
+
+    let body = Body::from_stream(ReaderStream::new(reader_half));
+
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .body(body)
+        .map_err(|e| anyhow::anyhow!("Failed to build response: {}", e))?;
+
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/zip"),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename=\"{}\"", zip_name))
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+    );
+
+    Ok(response)
+}
+
 pub async fn download_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -451,6 +587,11 @@ pub async fn download_handler(
             claims.path
         )));
     }
+
+    if path.is_dir() {
+        return stream_directory_as_zip(path, &claims).await;
+    }
+
 
     let file = fs::File::open(&path).await.map_err(|e| {
         error!("Failed to open file {}: {}", claims.path, e);

@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1.0, user-scalable=yes"
+        />
+        <title>RyanSend Admin - File Browser</title>
+        <style>
+            {{ theme_css|safe }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>RyanSend Admin With Directories</h1>
+            <div class="header-actions">
+                {% if !remove_kofi %}
+                <a href="https://ko-fi.com/N4N71RTZ6E" target="_blank"
+                    ><img
+                        height="36"
+                        style="border: 0px; height: 36px"
+                        src="https://storage.ko-fi.com/cdn/kofi6.png?v=6"
+                        border="0"
+                        alt="Buy Me a Coffee at ko-fi.com"
+                /></a>
+                {% endif %}
+                <a
+                    href="/admin/setup"
+                    class="logout-btn"
+                    style="background: #6c757d"
+                    >Settings</a
+                >
+                <a href="/admin/logout" class="logout-btn">Logout</a>
+            </div>
+        </div>
+
+        {% if current_path != "" %}
+        <div class="breadcrumb">
+            <div class="breadcrumb-path">Current Path: {{ current_path }}</div>
+        </div>
+        {% endif %}
+
+        <div class="search-container">
+            <form class="search-form" method="get">
+                <input type="hidden" name="path" value="{{ current_path }}" />
+                <input
+                    id="searchInput"
+                    type="text"
+                    name="search"
+                    class="search-input"
+                    placeholder="Search files and directories in current folder..."
+                    value="{{ search_query }}"
+                />
+                <button type="submit" class="search-btn">Search</button>
+            </form>
+        </div>
+
+        <script type="text/javascript">
+            // this will make it so when you press enter, the box gets focus at the end of the input
+            // immediately when the page loads after submit
+            let searchbox = document.getElementById("searchInput");
+            searchbox.setSelectionRange(
+                searchbox.value.length,
+                searchbox.value.length,
+            );
+            searchbox.focus();
+        </script>
+
+        {% if has_search_results %}
+        <div class="search-results">
+            <h3>
+                {% if search_results.len() > 0 %} Search Results ({{
+                search_results.len() }} found) {% else %} Search Results {%
+                endif %}
+            </h3>
+            {% if search_results.len() > 0 %}
+            <div class="file-list">
+                {% for entry in search_results %}
+                <div class="file-item">
+                    <div class="file-icon">📄</div>
+                    <div class="file-info">
+                        <div class="file-name" title="{{ entry.path }}">
+                            {{ entry.name }}
+                        </div>
+                        <div class="file-path" title="{{ entry.path }}">
+                            {{ entry.path_display }}
+                        </div>
+                    </div>
+                    <div class="file-size">
+                        {% if entry.is_dir %} - {% else %} {{ entry.size_display
+                        }} {% endif %}
+                    </div>
+                    <div class="file-actions">
+                        <div class="action-form">
+                            <form
+                                id="download-form-search-{{ loop.index0 }}"
+                                method="get"
+                                action="/admin/download"
+                                style="display: inline"
+                            >
+                                <input
+                                    type="hidden"
+                                    name="path"
+                                    value="{{ entry.path }}"
+                                />
+                                <input
+                                    type="hidden"
+                                    name="note"
+                                    value=""
+                                    id="download-note-search-{{ loop.index0 }}"
+                                />
+                                <button type="submit" class="btn btn-download">
+                                    Download
+                                </button>
+                            </form>
+                            <form
+                                id="share-form-search-{{ loop.index0 }}"
+                                method="get"
+                                action="/admin/share"
+                                style="display: inline"
+                            >
+                                <input
+                                    type="hidden"
+                                    name="path"
+                                    value="{{ entry.path }}"
+                                />
+                                <input
+                                    type="hidden"
+                                    name="note"
+                                    value=""
+                                    id="share-note-search-{{ loop.index0 }}"
+                                />
+                                <button type="submit" class="btn btn-share">
+                                    Share
+                                </button>
+                            </form>
+                            <form
+                                id="single-use-form-search-{{ loop.index0 }}"
+                                method="get"
+                                action="/admin/single-use"
+                                style="display: inline"
+                            >
+                                <input
+                                    type="hidden"
+                                    name="path"
+                                    value="{{ entry.path }}"
+                                />
+                                <input
+                                    type="hidden"
+                                    name="note"
+                                    value=""
+                                    id="single-use-note-search-{{ loop.index0 }}"
+                                />
+                                <button
+                                    type="submit"
+                                    class="btn btn-single-use"
+                                >
+                                    Single-use
+                                </button>
+                            </form>
+                            <input
+                                type="text"
+                                placeholder="Note (optional)"
+                                class="note-input"
+                                oninput="updateNotes('search-{{ loop.index0 }}', this.value)"
+                            />
+                        </div>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+            {% else %}
+            <div class="empty-state">
+                No files or directories found matching "{{ search_query }}" in
+                the current folder.
+            </div>
+            {% endif %}
+        </div>
+        {% endif %}
+
+        <div class="file-list">
+            {% if show_parent %}
+            <div class="file-item">
+                <div class="file-icon">📁</div>
+                <div class="file-info">
+                    <a
+                        href="/admin/files?path={{ parent_path }}{% if !search_query.is_empty() %}&search={{ search_query_encoded }}{% endif %}"
+                        class="directory-name"
+                        >.. (go back to parent directory)</a
+                    >
+                </div>
+                <div class="file-size">-</div>
+                <div class="file-actions"></div>
+            </div>
+            {% endif %} {% if entries.is_empty() %}
+            <div class="empty-state">No files or directories found</div>
+            {% else %} {% for entry in entries %}
+            <div class="file-item">
+                <div class="file-icon">
+                    {% if entry.is_dir %}📁{% else %}📄{% endif %}
+                </div>
+                <div class="file-info">
+                    {% if entry.is_dir %}
+                    <a
+                        href="/admin/files?path={{ entry.path }}{% if !search_query.is_empty() %}&search={{ search_query_encoded }}{% endif %}"
+                        class="directory-name"
+                        title="{{ entry.path }}"
+                        >{{ entry.name }}</a
+                    >
+                    {% else %}
+                    <div class="file-name" title="{{ entry.path }}">
+                        {{ entry.name }}
+                    </div>
+                    {% endif %}
+                </div>
+                <div class="file-size">
+                    {% if entry.is_dir %} - {% else %} {{ entry.size_display }}
+                    {% endif %}
+                </div>
+                <div class="file-actions">
+                    <div class="action-form">
+                        <form
+                            id="download-form-{{ loop.index0 }}"
+                            method="get"
+                            action="/admin/download"
+                            style="display: inline"
+                        >
+                            <input
+                                type="hidden"
+                                name="path"
+                                value="{{ entry.path }}"
+                            />
+                            <input
+                                type="hidden"
+                                name="note"
+                                value=""
+                                id="download-note-{{ loop.index0 }}"
+                            />
+                            <button type="submit" class="btn btn-download">
+                                Download
+                            </button>
+                        </form>
+                        <form
+                            id="share-form-{{ loop.index0 }}"
+                            method="get"
+                            action="/admin/share"
+                            style="display: inline"
+                        >
+                            <input
+                                type="hidden"
+                                name="path"
+                                value="{{ entry.path }}"
+                            />
+                            <input
+                                type="hidden"
+                                name="note"
+                                value=""
+                                id="share-note-{{ loop.index0 }}"
+                            />
+                            <button type="submit" class="btn btn-share">
+                                Share
+                            </button>
+                        </form>
+                        <form
+                            id="single-use-form-{{ loop.index0 }}"
+                            method="get"
+                            action="/admin/single-use"
+                            style="display: inline"
+                        >
+                            <input
+                                type="hidden"
+                                name="path"
+                                value="{{ entry.path }}"
+                            />
+                            <input
+                                type="hidden"
+                                name="note"
+                                value=""
+                                id="single-use-note-{{ loop.index0 }}"
+                            />
+                            <button type="submit" class="btn btn-single-use">
+                                Single-use
+                            </button>
+                        </form>
+                        <input
+                            type="text"
+                            placeholder="Note (optional)"
+                            class="note-input"
+                            oninput="updateNotes('{{ loop.index0 }}', this.value)"
+                        />
+                    </div>
+                </div>
+            </div>
+            {% endfor %} {% endif %}
+        </div>
+        <script>
+            function updateNotes(index, value) {
+                document.getElementById("download-note-" + index).value = value;
+                document.getElementById("share-note-" + index).value = value;
+                document.getElementById("single-use-note-" + index).value =
+                    value;
+            }
+        </script>
+    </body>
+</html>
