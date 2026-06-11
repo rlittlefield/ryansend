@@ -76,6 +76,21 @@ struct FileBrowserTemplate {
 }
 
 #[derive(Template)]
+#[template(path = "files_and_directories.html")]
+struct FileBrowserDirectoriesTemplate {
+    current_path: String,
+    entries: Vec<FileEntry>,
+    show_parent: bool,
+    parent_path: String,
+    search_query: String,
+    search_query_encoded: String,
+    search_results: Vec<FileEntry>,
+    has_search_results: bool,
+    remove_kofi: bool,
+    theme_css: &'static str,
+}
+
+#[derive(Template)]
 #[template(path = "setup.html")]
 struct SetupTemplate {
     base_url: String,
@@ -100,6 +115,7 @@ struct SetupTemplate {
     error: String,
     theme: String,
     theme_css: &'static str,
+    allow_share_directories: bool,
 }
 
 #[derive(Template)]
@@ -140,6 +156,8 @@ struct SetupForm {
     request_letsencrypt: Option<String>,
     tls_acme_email: Option<String>,
     admin_tls_port: Option<String>,
+    allow_share_directories: Option<String>,
+
 }
 
 #[derive(Deserialize)]
@@ -318,6 +336,14 @@ async fn admin_files_handler(
     State(state): State<AdminAppState>,
     Query(query): Query<FilesQuery>,
 ) -> Response {
+
+    let allow_share_directories = state
+    .config
+    .admin
+    .as_ref()
+    .map(|a| a.share_dirs)
+    .unwrap_or(false);
+
     // Get the sharing root from admin config (middleware ensures admin is enabled)
     let sharing_root = &state
         .config
@@ -450,28 +476,44 @@ async fn admin_files_handler(
             .map(|a| a.theme.clone())
             .unwrap_or(AdminTheme::Light),
     };
-    let template = FileBrowserTemplate {
-        current_path,
-        entries,
-        show_parent,
-        parent_path,
-        search_query: search_query_str,
-        search_query_encoded,
-        search_results,
-        has_search_results,
-        remove_kofi: state.config.remove_kofi,
-        theme_css: get_theme_css(&theme),
-    };
 
-    let html = template
+    let html = if allow_share_directories {
+        FileBrowserDirectoriesTemplate {
+            current_path,
+            entries,
+            show_parent,
+            parent_path,
+            search_query: search_query_str,
+            search_query_encoded,
+            search_results,
+            has_search_results,
+            remove_kofi: state.config.remove_kofi,
+            theme_css: get_theme_css(&theme),
+        }
         .render()
-        .unwrap_or_else(|_| "Template error".to_string());
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "text/html")
-        .body(Body::from(html))
-        .expect("Failed to build file browser response")
-}
+        .unwrap_or_else(|_| "Template error".to_string())
+    } else {
+        FileBrowserTemplate {
+            current_path,
+            entries,
+            show_parent,
+            parent_path,
+            search_query: search_query_str,
+            search_query_encoded,
+            search_results,
+            has_search_results,
+            remove_kofi: state.config.remove_kofi,
+            theme_css: get_theme_css(&theme),
+        }
+        .render()
+        .unwrap_or_else(|_| "Template error".to_string())
+    };
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/html")
+            .body(Body::from(html))
+            .expect("Failed to build file browser response")
+    }
 
 /// Check if a search query contains glob pattern characters
 fn has_glob_chars(query: &str) -> bool {
@@ -602,6 +644,14 @@ async fn admin_download_handler(
     State(state): State<AdminAppState>,
     Query(query): Query<AdminDownloadQuery>,
 ) -> Response {
+    
+    let allow_share_directories = state
+    .config
+    .admin
+    .as_ref()
+    .map(|a| a.share_dirs)
+    .unwrap_or(false);
+
     // Middleware ensures admin is enabled and authenticated
     let admin_config = state
         .config
@@ -633,7 +683,7 @@ async fn admin_download_handler(
 
     let file_path = canonical_full;
 
-    if !file_path.exists() || file_path.is_dir() {
+    if !file_path.exists() || file_path.is_dir() && allow_share_directories == false {
         return make_admin_error_response(StatusCode::NOT_FOUND);
     }
 
@@ -669,6 +719,14 @@ async fn admin_share_handler(
     State(state): State<AdminAppState>,
     Query(query): Query<AdminDownloadQuery>,
 ) -> Response {
+
+    let allow_share_directories = state
+    .config
+    .admin
+    .as_ref()
+    .map(|a| a.share_dirs)
+    .unwrap_or(false);
+
     // Middleware ensures admin is enabled and authenticated
     let admin_config = state
         .config
@@ -700,7 +758,7 @@ async fn admin_share_handler(
 
     let file_path = canonical_full;
 
-    if !file_path.exists() || file_path.is_dir() {
+    if !file_path.exists() || file_path.is_dir() && allow_share_directories == false {
         return make_admin_error_response(StatusCode::NOT_FOUND);
     }
 
@@ -730,12 +788,21 @@ async fn admin_single_use_download_handler(
     State(state): State<AdminAppState>,
     Query(query): Query<AdminDownloadQuery>,
 ) -> Response {
+    let allow_share_directories = state
+    .config
+    .admin
+    .as_ref()
+    .map(|a| a.share_dirs)
+    .unwrap_or(false);
+
     // Middleware ensures admin is enabled and authenticated
     let admin_config = state
         .config
         .admin
         .as_ref()
         .expect("Admin config should exist when middleware passes");
+
+
 
     // Construct and validate file path within sharing root
     let base_path = PathBuf::from(&admin_config.sharing_root);
@@ -761,7 +828,7 @@ async fn admin_single_use_download_handler(
 
     let file_path = canonical_full;
 
-    if !file_path.exists() || file_path.is_dir() {
+    if !file_path.exists() || file_path.is_dir() && allow_share_directories == false {
         return make_admin_error_response(StatusCode::NOT_FOUND);
     }
 
@@ -880,6 +947,7 @@ async fn admin_setup_page(State(state): State<AdminAppState>) -> Html<String> {
         admin_sharing_root: admin_config
             .map(|a| a.sharing_root.clone())
             .unwrap_or_default(),
+        allow_share_directories: admin_config.map(|a| a.share_dirs).unwrap_or(false),
         admin_default_exp_seconds: admin_config
             .and_then(|a| a.default_expiration_seconds)
             .unwrap_or(3600),
@@ -945,6 +1013,8 @@ async fn admin_setup_handler(
             admin_sharing_root: admin_config
                 .map(|a| a.sharing_root.clone())
                 .unwrap_or_default(),
+            allow_share_directories: admin_config.map(|a| a.share_dirs).unwrap_or(false),
+
             admin_default_exp_seconds: admin_config
                 .and_then(|a| a.default_expiration_seconds)
                 .unwrap_or(3600),
@@ -1022,6 +1092,7 @@ async fn admin_setup_handler(
         admin.enabled = form.admin_enabled.is_some();
         admin.port = form.admin_port;
         admin.sharing_root = form.admin_sharing_root.clone();
+        admin.share_dirs = form.allow_share_directories.is_some();
         admin.tls_port = form.admin_tls_port.and_then(|s| s.parse().ok());
         admin.default_expiration_seconds = form.admin_default_exp_seconds;
         admin.theme = match form.admin_theme.as_deref() {
@@ -1280,6 +1351,7 @@ async fn admin_setup_handler(
                 admin_sharing_root: admin_config
                     .map(|a| a.sharing_root.clone())
                     .unwrap_or_default(),
+                allow_share_directories: admin_config.map(|a| a.share_dirs).unwrap_or(false),
                 admin_default_exp_seconds: admin_config
                     .and_then(|a| a.default_expiration_seconds)
                     .unwrap_or(3600),

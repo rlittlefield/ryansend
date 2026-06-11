@@ -186,6 +186,22 @@
                     </div>
 
                     <div class="form-group">
+                        <label class="checkbox-label">
+                            <input
+                                type="checkbox"
+                                name="allow_share_directories"
+                                {%
+                                if
+                                allow_share_directories
+                                %}checked{%
+                                endif
+                                %}
+                            />
+                            Allow Directories To Be Shared (Beta)
+                        </label>
+                    </div>
+
+                    <div class="form-group">
                         <label for="admin_default_exp_seconds"
                             >Default Link Expiration (seconds)</label
                         >

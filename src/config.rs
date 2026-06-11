@@ -52,6 +52,7 @@ pub struct AdminConfig {
     pub password: String,
     pub sharing_root: String,
     #[serde(default)]
+    pub share_dirs: bool,
     pub tls_port: Option<u16>,
     #[serde(default)]
     pub default_expiration_seconds: Option<u64>,
@@ -312,6 +313,7 @@ pub async fn init_config(base_url: String, port: u16) -> Result<Option<String>> 
         port: admin_port,
         password: password_hash,
         sharing_root: ".".to_string(),
+        share_dirs: false,
         tls_port: admin_tls_port,
         default_expiration_seconds: None,
         hashed_sharing_secrets: Vec::new(),
