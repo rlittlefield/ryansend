@@ -78,7 +78,7 @@
             <div class="file-list">
                 {% for entry in search_results %}
                 <div class="file-item">
-                    <div class="file-icon">📄</div>
+                    <div class="file-icon">{% if entry.is_dir %}📁{% else %}📄{% endif %}</div>
                     <div class="file-info">
                         <div class="file-name" title="{{ entry.path }}">
                             {{ entry.name }}
@@ -91,7 +91,6 @@
                         {% if entry.is_dir %} - {% else %} {{ entry.size_display
                         }} {% endif %}
                     </div>
-                    {% if !entry.is_dir %}
                     <div class="file-actions">
                         <div class="action-form">
                             <form
@@ -168,7 +167,6 @@
                             />
                         </div>
                     </div>
-                    {% endif %}
                 </div>
                 {% endfor %}
             </div>
@@ -220,7 +218,6 @@
                     {% if entry.is_dir %} - {% else %} {{ entry.size_display }}
                     {% endif %}
                 </div>
-                {% if !entry.is_dir %}
                 <div class="file-actions">
                     <div class="action-form">
                         <form
@@ -294,9 +291,6 @@
                         />
                     </div>
                 </div>
-                {% else %}
-                <div class="file-actions"></div>
-                {% endif %}
             </div>
             {% endfor %} {% endif %}
         </div>

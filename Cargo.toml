@@ -41,7 +41,7 @@ axum-server = { version = "0.8", features = ["tls-rustls"] }
 instant-acme = { version = "0.8", features = ["hyper-rustls"] }
 rcgen = "0.14.6"
 base64 = "0.22"
-async_zip = { version = "0.0.17", features = ["deflate", "tokio"] }
+async_zip = { version = "0.0.17", default-features = false, features = ["tokio", "chrono"] }
 
 [dev-dependencies]
 tempfile = "3.8"
