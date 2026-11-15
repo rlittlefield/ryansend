@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use chrono::{DateTime, Duration, Utc};
 use log::info;
-use rand::{rng, Rng};
+use rand::{rng, RngExt};
 use rusty_paseto::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;

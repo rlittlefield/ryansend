@@ -247,7 +247,7 @@ async fn main() -> Result<()> {
             tunnel_secret,
         } => {
             use crate::tunnel::TunnelClient;
-            use rand::Rng;
+            use rand::RngExt;
 
             // Resolve server address - check arg or env var
             let server_addr = match server_addr.or_else(|| std::env::var("RYANSEND_BASE_URL").ok())

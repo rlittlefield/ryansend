@@ -3,12 +3,12 @@ FROM rust:1.92-bookworm AS builder
 
 WORKDIR /usr/src/app
 
-# Install cargo-about for license generation
-RUN cargo install cargo-about
+# Install cargo-about for license generation. Pinned so new releases can't
+# break the build. Since 0.9.0 the binary needs the cli feature.
+RUN cargo install --locked cargo-about --version 0.9.3 --features cli
 
 # Copy manifests and configuration
-COPY Cargo.toml ./
-COPY askama.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY about.hbs ./
 COPY about.toml ./
 
@@ -17,7 +17,8 @@ COPY src ./src
 COPY templates ./templates
 
 # Build the application in release mode
-RUN cargo build --release
+# --locked builds the exact dependency versions from Cargo.lock
+RUN cargo build --release --locked
 
 # Generate license compliance file
 RUN cargo about generate about.hbs > licenses.html

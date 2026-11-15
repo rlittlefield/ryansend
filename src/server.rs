@@ -1118,6 +1118,9 @@ mod directory_zip_tests {
     use std::collections::BTreeMap;
 
     /// Zips `root` into memory and returns each entry's name mapped to its contents.
+    // async_zip is midway through replacing this reader (read1 is due to be renamed back to
+    // read), so keep the stable one in this test helper until that settles.
+    #[allow(deprecated)]
     async fn zip_entries(root: &FsPath) -> BTreeMap<String, Vec<u8>> {
         let mut out = Vec::new();
         tokio::time::timeout(

@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Result};
-use argon2::password_hash::{rand_core::OsRng, SaltString};
 use argon2::{Argon2, PasswordHasher};
 use rand::prelude::*;
 use rusty_paseto::prelude::*;
@@ -129,7 +128,7 @@ pub async fn load_config() -> Result<Config> {
         .await
         .map_err(|_| anyhow!("Failed to read {}. Make sure it exists", config_path))?;
 
-    let mut config: Config = serde_yaml::from_str(&config_content)
+    let mut config: Config = serde_saphyr::from_str(&config_content)
         .map_err(|e| anyhow!("Failed to parse {}: {}", config_path, e))?;
 
     // Set default value for remove_kofi if not present
@@ -257,10 +256,10 @@ pub async fn load_config_or_env() -> Result<Config> {
 }
 
 fn generate_argon2_hash(password: &str) -> Result<String> {
-    let salt = SaltString::generate(&mut OsRng);
+    // argon2 0.6 generates a random salt itself
     let argon2 = Argon2::default();
     let password_hash = argon2
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map_err(|e| anyhow!("Failed to hash password: {}", e))?;
     Ok(password_hash.to_string())
 }
@@ -344,8 +343,8 @@ pub async fn init_config(base_url: String, port: u16) -> Result<Option<String>> 
         ));
     }
 
-    let config_content =
-        serde_yaml::to_string(&config).map_err(|e| anyhow!("Failed to serialize config: {}", e))?;
+    let config_content = serde_saphyr::to_string(&config)
+        .map_err(|e| anyhow!("Failed to serialize config: {}", e))?;
 
     fs::write(&config_path, config_content)
         .await
@@ -384,8 +383,8 @@ pub async fn update_admin_password(new_password: &str) -> Result<()> {
     }
 
     // Write the updated config back to file
-    let config_content =
-        serde_yaml::to_string(&config).map_err(|e| anyhow!("Failed to serialize config: {}", e))?;
+    let config_content = serde_saphyr::to_string(&config)
+        .map_err(|e| anyhow!("Failed to serialize config: {}", e))?;
 
     let config_path = get_config_file_path();
     fs::write(&config_path, config_content)
@@ -399,8 +398,8 @@ pub async fn update_admin_password(new_password: &str) -> Result<()> {
 
 /// Save the current config to the config file
 pub async fn save_config(config: &Config) -> Result<()> {
-    let config_content =
-        serde_yaml::to_string(config).map_err(|e| anyhow!("Failed to serialize config: {}", e))?;
+    let config_content = serde_saphyr::to_string(config)
+        .map_err(|e| anyhow!("Failed to serialize config: {}", e))?;
 
     let config_path = get_config_file_path();
     fs::write(&config_path, config_content)
@@ -479,7 +478,7 @@ remove_kofi: false
 
         // Parse the config
         let mut config: Config =
-            serde_yaml::from_str(test_config).expect("Failed to parse test config YAML");
+            serde_saphyr::from_str(test_config).expect("Failed to parse test config YAML");
 
         // Set the environment variable
         env::set_var("RYANSEND_ADMIN_PORT", "4001");
@@ -547,7 +546,7 @@ remove_kofi: false
 
         // Parse the config
         let mut config: Config =
-            serde_yaml::from_str(test_config).expect("Failed to parse test config YAML");
+            serde_saphyr::from_str(test_config).expect("Failed to parse test config YAML");
 
         // Set the TLS environment variables
         env::set_var("RYANSEND_TLS_PORT", "8443");

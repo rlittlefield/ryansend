@@ -1,6 +1,0 @@
-[general]
-# Template directory relative to the crate root
-dir = "templates"
-
-# Template extension (default is .html)
-ext = "html"
