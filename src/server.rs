@@ -13,7 +13,7 @@ use axum::{
 use log::{debug, error, info, warn};
 use serde::Deserialize;
 use std::io::SeekFrom;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use timedmap::TimedMap;
 use tokio::fs;
@@ -29,10 +29,8 @@ use crate::tls::{self, ChallengeStore};
 use crate::tunnel::{TunnelFileInfo, TunnelManager};
 use crate::ReloadSignal;
 
-use walkdir::WalkDir;
-
 use async_zip::tokio::write::ZipFileWriter;
-use async_zip::{Compression, ZipEntryBuilder};
+use async_zip::{Compression, ZipDateTime, ZipEntryBuilder};
 use futures::AsyncWriteExt as FuturesAsyncWriteExt;
 
 #[derive(Debug, Clone)]
@@ -317,122 +315,348 @@ pub async fn tunnel_upload_handler(
         .map_err(|e| anyhow::anyhow!("Failed to build response: {}", e))?)
 }
 
-const CHUNK_SIZE: usize = 64 * 1024;
+/// Read buffer size used when copying files into a directory ZIP.
+const ZIP_CHUNK_SIZE: usize = 64 * 1024;
 
+/// Size of the in-memory pipe between the ZIP writer task and the HTTP response body.
+/// This bounds per-download memory: the archive is streamed, never buffered as a whole.
+const ZIP_PIPE_SIZE: usize = 256 * 1024;
+
+/// One entry to add to a directory ZIP.
+enum ZipItem {
+    /// A directory; `name` ends in `/`.
+    Dir {
+        path: PathBuf,
+        name: String,
+    },
+    File {
+        path: PathBuf,
+        name: String,
+    },
+}
+
+/// Lazily walks a directory tree with async I/O, one directory listing at a time, yielding the
+/// entries that belong in its ZIP. Symlinks, sockets, FIFOs and device files are skipped, never
+/// followed: following a symlink could leak files from outside the shared directory, and opening
+/// a FIFO blocks forever. Unreadable subdirectories are skipped with a warning; an unreadable
+/// root is an error.
+struct ZipWalker {
+    root: PathBuf,
+    /// Directories still to list, as (absolute path, name prefix inside the archive).
+    pending: Vec<(PathBuf, String)>,
+    ready: std::collections::VecDeque<ZipItem>,
+}
+
+impl ZipWalker {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            pending: vec![(root.clone(), String::new())],
+            root,
+            ready: std::collections::VecDeque::new(),
+        }
+    }
+
+    async fn next(&mut self) -> Result<Option<ZipItem>> {
+        loop {
+            if let Some(item) = self.ready.pop_front() {
+                return Ok(Some(item));
+            }
+            let Some((dir, prefix)) = self.pending.pop() else {
+                return Ok(None);
+            };
+            let mut listing = match fs::read_dir(&dir).await {
+                Ok(listing) => listing,
+                Err(e) if dir == self.root => return Err(e.into()),
+                Err(e) => {
+                    warn!(
+                        "ZIP: skipping unreadable directory {}: {}",
+                        dir.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+            let mut children = Vec::new();
+            loop {
+                match listing.next_entry().await {
+                    Ok(Some(entry)) => children.push(entry),
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!("ZIP: error listing {}: {}", dir.display(), e);
+                        break;
+                    }
+                }
+            }
+            children.sort_by_key(|entry| entry.file_name());
+
+            let mut subdirs = Vec::new();
+            for child in children {
+                // DirEntry::file_type does not follow symlinks, so a symlink reports as a symlink.
+                let file_type = match child.file_type().await {
+                    Ok(file_type) => file_type,
+                    Err(e) => {
+                        warn!("ZIP: skipping {}: {}", child.path().display(), e);
+                        continue;
+                    }
+                };
+                let name = format!("{}{}", prefix, zip_name_component(&child.file_name()));
+                if file_type.is_dir() {
+                    subdirs.push((child.path(), format!("{}/", name)));
+                } else if file_type.is_file() {
+                    self.ready.push_back(ZipItem::File {
+                        path: child.path(),
+                        name,
+                    });
+                } else {
+                    debug!(
+                        "ZIP: skipping symlink or special file {}",
+                        child.path().display()
+                    );
+                }
+            }
+            for (path, name) in &subdirs {
+                // Explicit directory entries keep empty directories in the extracted archive.
+                self.ready.push_back(ZipItem::Dir {
+                    path: path.clone(),
+                    name: name.clone(),
+                });
+            }
+            // Reverse so the stack pops subdirectories in name order.
+            self.pending.extend(subdirs.into_iter().rev());
+        }
+    }
+}
+
+/// Whether the ZIP of `root` could exceed the classic format's limits (4 GiB of offsets or sizes,
+/// or 65,535 entries) and therefore needs Zip64.
+///
+/// async_zip's streamed Zip64 entries can't be opened by macOS Archive Utility (Finder) or
+/// `ditto`, so archives that fit are written without Zip64. This is a metadata-only pass that
+/// stops as soon as a limit is crossed, so it stays cheap even for huge trees. If files grow
+/// between this scan and the write, the writer refuses to exceed the limits and the download is
+/// aborted with an error rather than producing a corrupt archive.
+async fn directory_needs_zip64(root: &FsPath) -> Result<bool> {
+    let mut walker = ZipWalker::new(root.to_path_buf());
+    let mut entries: u64 = 0;
+    let mut archive_bytes: u64 = 0;
+    while let Some(item) = walker.next().await? {
+        let (path, name) = match &item {
+            ZipItem::Dir { path, name } | ZipItem::File { path, name } => (path, name),
+        };
+        if let ZipItem::File { .. } = item {
+            archive_bytes += fs::symlink_metadata(path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+        }
+        // Generous allowance for the local header, data descriptor, central directory record and
+        // a Unicode path extra field, each of which can repeat the name.
+        archive_bytes += 4 * name.len() as u64 + 256;
+        entries += 1;
+        if entries >= u16::MAX as u64 || archive_bytes >= u32::MAX as u64 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Streams `root` and everything beneath it into `writer` as a ZIP archive.
+///
+/// - Entries come from [`ZipWalker`], which never follows symlinks or opens special files, and
+///   each file is re-checked against `root` right before it is opened.
+/// - Entries are stored uncompressed, so a ZIP download costs about the same CPU as a plain file
+///   download (just CRC32), and concurrent downloads of a share link can't pin the server's cores.
+/// - The walk is lazy and async, so neither a huge tree nor a slow client ties up a runtime or
+///   blocking-pool thread for the length of the download.
+///
+/// Unreadable files and subdirectories are skipped with a warning. Any other failure is returned
+/// as an error so the caller can abort the response instead of ending it cleanly, which would
+/// leave the client with a truncated archive that looks complete.
+async fn write_directory_zip<W>(root: PathBuf, writer: W) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let root = fs::canonicalize(&root).await?;
+    let mut zip = ZipFileWriter::with_tokio(writer);
+    if directory_needs_zip64(&root).await? {
+        info!(
+            "ZIP of {} exceeds 4 GiB or 65,535 entries; using Zip64, which macOS Archive Utility may not open",
+            root.display()
+        );
+    } else {
+        zip = zip.force_no_zip64();
+    }
+
+    let mut buf = vec![0u8; ZIP_CHUNK_SIZE];
+    let mut walker = ZipWalker::new(root.clone());
+    while let Some(item) = walker.next().await? {
+        match item {
+            ZipItem::Dir { path, name } => {
+                let mut builder = ZipEntryBuilder::new(name.into(), Compression::Stored);
+                if let Ok(modified) = fs::metadata(&path).await.and_then(|m| m.modified()) {
+                    builder = builder.last_modification_date(zip_timestamp(modified));
+                }
+                zip.write_entry_whole(builder, &[]).await?;
+            }
+            ZipItem::File { path, name } => {
+                add_file_to_zip(&mut zip, &root, &path, name, &mut buf).await?;
+            }
+        }
+    }
+
+    zip.close().await?;
+    Ok(())
+}
+
+/// Converts one path component into a ZIP entry name component.
+///
+/// On Unix a backslash is a legal filename character, but Windows extractors treat it as a path
+/// separator, so a file named `..\..\evil` could escape the extraction directory on the
+/// recipient's machine. Replace it rather than translate it.
+fn zip_name_component(name: &std::ffi::OsStr) -> String {
+    name.to_string_lossy().replace('\\', "_")
+}
+
+/// Copies one regular file into the archive. Files that can't be opened are skipped; failures
+/// after the entry has been started are fatal because the entry can't be taken back.
+async fn add_file_to_zip<W>(
+    zip: &mut ZipFileWriter<W>,
+    root: &FsPath,
+    path: &FsPath,
+    name: String,
+    buf: &mut [u8],
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut file = match open_within_root(path, root).await {
+        Some(file) => file,
+        None => return Ok(()),
+    };
+
+    let mut builder = ZipEntryBuilder::new(name.into(), Compression::Stored);
+    if let Ok(modified) = file.metadata().await.and_then(|m| m.modified()) {
+        builder = builder.last_modification_date(zip_timestamp(modified));
+    }
+
+    let mut entry = zip.write_entry_stream(builder).await?;
+    loop {
+        let n = file.read(buf).await?;
+        if n == 0 {
+            break;
+        }
+        entry.write_all(&buf[..n]).await?;
+    }
+    entry.close().await?;
+    Ok(())
+}
+
+/// Opens `path` for reading only if it is a regular file whose real location is inside `root`.
+async fn open_within_root(path: &FsPath, root: &FsPath) -> Option<fs::File> {
+    let canonical = match fs::canonicalize(path).await {
+        Ok(canonical) => canonical,
+        Err(e) => {
+            warn!("ZIP: skipping {}: {}", path.display(), e);
+            return None;
+        }
+    };
+    if !canonical.starts_with(root) {
+        warn!(
+            "ZIP: skipping {}: resolves outside the shared directory",
+            path.display()
+        );
+        return None;
+    }
+    match fs::symlink_metadata(&canonical).await {
+        Ok(meta) if meta.is_file() => {}
+        _ => {
+            warn!("ZIP: skipping {}: not a regular file", path.display());
+            return None;
+        }
+    }
+    match fs::File::open(&canonical).await {
+        Ok(file) => Some(file),
+        Err(e) => {
+            warn!("ZIP: skipping {}: {}", path.display(), e);
+            None
+        }
+    }
+}
+
+/// ZIP timestamps are local time with a representable range of 1980 to 2107.
+fn zip_timestamp(time: std::time::SystemTime) -> ZipDateTime {
+    use chrono::Datelike;
+    let local = chrono::DateTime::<chrono::Local>::from(time).naive_local();
+    let clamped = if local.year() < 1980 {
+        chrono::NaiveDate::from_ymd_opt(1980, 1, 1)
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .unwrap_or(local)
+    } else if local.year() > 2107 {
+        chrono::NaiveDate::from_ymd_opt(2107, 12, 31)
+            .and_then(|d| d.and_hms_opt(23, 59, 58))
+            .unwrap_or(local)
+    } else {
+        local
+    };
+    ZipDateTime::from_chrono(&clamped.and_utc())
+}
+
+/// Responds with a streaming ZIP of the directory a filesystem share token points at.
 async fn stream_directory_as_zip(
     path: PathBuf,
     claims: &crate::auth::TokenClaims,
 ) -> AppResult<Response> {
-    if !path.exists() {
-        return Err(AppError::not_found(anyhow!("Directory not found")));
-    }
-    if !path.is_dir() {
-        return Err(AppError::not_found(anyhow!("Not a directory")));
-    }
-
-    let dir_name = path
+    // Quotes and control characters would break the Content-Disposition header.
+    let dir_name: String = path
         .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("archive")
-        .to_owned();
-
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "archive".to_string())
+        .chars()
+        .map(|c| if c == '"' || c.is_control() { '_' } else { c })
+        .collect();
     let zip_name = format!("{}.zip", dir_name);
 
     let note_info = match &claims.note {
         Some(note) => format!(" (note: \"{}\")", note),
         None => String::new(),
     };
-
     info!(
         "Directory ZIP started: '{}' from path: {} [token_id: {}]{}",
-        dir_name, claims.path, claims.id, note_info
+        zip_name, claims.path, claims.id, note_info
     );
 
-    // Collect entries (metadata only)
-    let mut entries: Vec<(PathBuf, String, bool)> = Vec::new();
-    for entry in WalkDir::new(&path) {
-        let entry = entry.map_err(|e| anyhow::anyhow!("WalkDir error: {}", e))?;
+    let (writer, reader) = tokio::io::duplex(ZIP_PIPE_SIZE);
+    // If the client disconnects, the reader is dropped and the writer's next write fails with
+    // BrokenPipe, which ends this task.
+    let zip_task = tokio::spawn(write_directory_zip(path, writer));
 
-        let rel = match entry.path().strip_prefix(&path) {
-            Ok(p) if !p.as_os_str().is_empty() => p.to_string_lossy().replace('\\', "/"),
-            _ => continue,
+    let token_id = claims.id.clone();
+    let body_stream = async_stream::stream! {
+        use futures::StreamExt;
+        let mut chunks = ReaderStream::new(reader);
+        while let Some(chunk) = chunks.next().await {
+            yield chunk;
+        }
+        // The writer side has closed. Only end the response cleanly if the archive is complete;
+        // otherwise yield an error so the connection is aborted and the client sees a failure.
+        let failure = match zip_task.await {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(e) => Some(e.to_string()),
         };
-
-        entries.push((entry.path().to_owned(), rel, entry.file_type().is_dir()));
-    }
-
-    let (writer_half, reader_half) = tokio::io::duplex(256 * 1024);
-
-    tokio::spawn(async move {
-        let mut zip = ZipFileWriter::with_tokio(writer_half);
-
-        for (full_path, rel_name, is_dir) in entries {
-            if is_dir {
-                let entry_name = format!("{}/", rel_name);
-                let builder = ZipEntryBuilder::new(entry_name.into(), Compression::Stored);
-
-                if let Err(e) = zip.write_entry_whole(builder, &[]).await {
-                    error!("ZIP dir error '{}': {}", rel_name, e);
-                    return;
-                }
-                continue;
-            }
-
-            let builder =
-                ZipEntryBuilder::new(rel_name.clone().into(), Compression::Deflate);
-
-            let mut entry_writer = match zip.write_entry_stream(builder).await {
-                Ok(w) => w,
-                Err(e) => {
-                    error!("ZIP entry open error '{}': {}", rel_name, e);
-                    return;
-                }
-            };
-
-            let mut file = match tokio::fs::File::open(&full_path).await {
-                Ok(f) => f,
-                Err(e) => {
-                    error!("Cannot open '{}': {}", full_path.display(), e);
-                    return;
-                }
-            };
-
-            let mut buf = vec![0u8; CHUNK_SIZE];
-
-            loop {
-                match file.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if let Err(e) = entry_writer.write_all(&buf[..n]).await {
-                            error!("ZIP write error '{}': {}", rel_name, e);
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        error!("Read error '{}': {}", full_path.display(), e);
-                        return;
-                    }
-                }
-            }
-
-            if let Err(e) = entry_writer.close().await {
-                error!("ZIP close error '{}': {}", rel_name, e);
-                return;
+        match failure {
+            None => info!("Directory ZIP completed: '{}' [token_id: {}]", zip_name, token_id),
+            Some(e) => {
+                error!("Directory ZIP failed: '{}' [token_id: {}]: {}", zip_name, token_id, e);
+                yield Err(std::io::Error::other(e));
             }
         }
-
-        if let Err(e) = zip.close().await {
-            error!("ZIP finalization error: {}", e);
-        }
-    });
-
-    let body = Body::from_stream(ReaderStream::new(reader_half));
+    };
 
     let mut response = Response::builder()
         .status(StatusCode::OK)
-        .body(body)
+        .body(Body::from_stream(body_stream))
         .map_err(|e| anyhow::anyhow!("Failed to build response: {}", e))?;
-
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_TYPE,
@@ -440,10 +664,9 @@ async fn stream_directory_as_zip(
     );
     headers.insert(
         header::CONTENT_DISPOSITION,
-        HeaderValue::from_str(&format!("attachment; filename=\"{}\"", zip_name))
-            .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+        HeaderValue::from_str(&format!("attachment; filename=\"{}.zip\"", dir_name))
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"archive.zip\"")),
     );
-
     Ok(response)
 }
 
@@ -591,7 +814,6 @@ pub async fn download_handler(
     if path.is_dir() {
         return stream_directory_as_zip(path, &claims).await;
     }
-
 
     let file = fs::File::open(&path).await.map_err(|e| {
         error!("Failed to open file {}: {}", claims.path, e);
@@ -888,4 +1110,155 @@ async fn run_http_only_server(
         .map_err(|e| anyhow!("Server error: {}", e))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod directory_zip_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// Zips `root` into memory and returns each entry's name mapped to its contents.
+    async fn zip_entries(root: &FsPath) -> BTreeMap<String, Vec<u8>> {
+        let mut out = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            write_directory_zip(root.to_path_buf(), &mut out),
+        )
+        .await
+        .expect("zipping timed out")
+        .expect("zipping failed");
+
+        let reader = async_zip::base::read::mem::ZipFileReader::new(out)
+            .await
+            .expect("archive should be readable");
+        let mut entries = BTreeMap::new();
+        for index in 0..reader.file().entries().len() {
+            let mut entry = reader.reader_with_entry(index).await.unwrap();
+            let name = entry.entry().filename().as_str().unwrap().to_string();
+            let mut data = Vec::new();
+            entry.read_to_end_checked(&mut data).await.unwrap();
+            entries.insert(name, data);
+        }
+        entries
+    }
+
+    #[tokio::test]
+    async fn zips_nested_tree_with_empty_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), b"hello").unwrap();
+        std::fs::create_dir_all(root.join("sub/deeper")).unwrap();
+        std::fs::write(root.join("sub/b.txt"), b"world").unwrap();
+        std::fs::write(root.join("sub/deeper/c.bin"), vec![7u8; 200_000]).unwrap();
+        std::fs::create_dir(root.join("empty")).unwrap();
+
+        let entries = zip_entries(root).await;
+        let names: Vec<&str> = entries.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            [
+                "a.txt",
+                "empty/",
+                "sub/",
+                "sub/b.txt",
+                "sub/deeper/",
+                "sub/deeper/c.bin"
+            ]
+        );
+        assert_eq!(entries["a.txt"], b"hello");
+        assert_eq!(entries["sub/b.txt"], b"world");
+        assert_eq!(entries["sub/deeper/c.bin"], vec![7u8; 200_000]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skips_symlinks_pointing_outside_the_shared_directory() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), b"top secret").unwrap();
+
+        let shared = tempfile::tempdir().unwrap();
+        let root = shared.path();
+        std::fs::write(root.join("ok.txt"), b"fine").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), root.join("file-link"))
+            .unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("dir-link")).unwrap();
+        // Even a symlink that stays inside the directory is skipped rather than followed.
+        std::os::unix::fs::symlink(root.join("ok.txt"), root.join("inner-link")).unwrap();
+
+        let entries = zip_entries(root).await;
+        assert_eq!(entries.keys().collect::<Vec<_>>(), ["ok.txt"]);
+        assert!(!entries.values().any(|data| data == b"top secret"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skips_fifos_instead_of_blocking() {
+        let shared = tempfile::tempdir().unwrap();
+        let root = shared.path();
+        std::fs::write(root.join("ok.txt"), b"fine").unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(root.join("pipe"))
+            .status()
+            .expect("mkfifo should run");
+        assert!(status.success());
+
+        let entries = zip_entries(root).await;
+        assert_eq!(entries.keys().collect::<Vec<_>>(), ["ok.txt"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backslashes_in_names_cannot_become_path_separators() {
+        let shared = tempfile::tempdir().unwrap();
+        std::fs::write(shared.path().join("..\\..\\evil.txt"), b"x").unwrap();
+
+        let entries = zip_entries(shared.path()).await;
+        assert_eq!(entries.keys().collect::<Vec<_>>(), [".._.._evil.txt"]);
+    }
+
+    #[tokio::test]
+    async fn uses_zip64_only_when_limits_could_be_exceeded() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("small.txt"), b"hi").unwrap();
+        assert!(!directory_needs_zip64(dir.path()).await.unwrap());
+
+        // A sparse 5 GiB file takes no real disk space but needs Zip64.
+        let big = std::fs::File::create(dir.path().join("big.bin")).unwrap();
+        big.set_len(5 << 30).unwrap();
+        assert!(directory_needs_zip64(dir.path()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_archive_aborts_the_response_body() {
+        let missing = tempfile::tempdir().unwrap().path().join("gone");
+        let claims = crate::auth::TokenClaims {
+            path: missing.to_string_lossy().to_string(),
+            exp: chrono::Utc::now() + chrono::Duration::minutes(5),
+            id: "test".to_string(),
+            max_uses: None,
+            note: None,
+            source: TokenSource::FileSystem,
+        };
+        let Ok(response) = stream_directory_as_zip(missing, &claims).await else {
+            panic!("building the response should succeed");
+        };
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert!(
+            body.is_err(),
+            "a failed ZIP must error the body, not end it cleanly"
+        );
+    }
+
+    #[test]
+    fn timestamps_outside_zip_range_are_clamped() {
+        use chrono::TimeZone;
+        let epoch = zip_timestamp(std::time::UNIX_EPOCH);
+        assert_eq!(epoch.year(), 1980);
+        let modern = chrono::Local
+            .with_ymd_and_hms(2024, 6, 1, 12, 30, 10)
+            .unwrap();
+        let ts = zip_timestamp(modern.into());
+        assert_eq!((ts.year(), ts.month(), ts.day()), (2024, 6, 1));
+        assert_eq!((ts.hour(), ts.minute(), ts.second()), (12, 30, 10));
+    }
 }
