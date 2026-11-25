@@ -1,0 +1,45 @@
+# When a push to main changes the version in Cargo.toml, tag it as vX.Y.Z.
+# The tag triggers CircleCI's docker-publish workflow.
+name: Tag release
+
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.toml]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tag and create a GitHub release if the version changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          version_of() { sed -n 's/^version = "\([0-9.]*\)"$/\1/p' | head -n 1; }
+
+          new=$(version_of < Cargo.toml)
+          old=$(git show "$BEFORE:Cargo.toml" 2>/dev/null | version_of || true)
+          if [ -z "$new" ] || [ "$new" = "$old" ]; then
+            echo "Version unchanged (${new:-unknown}), nothing to tag."
+            exit 0
+          fi
+
+          tag="v$new"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" > /dev/null; then
+            echo "$tag already exists."
+            exit 0
+          fi
+
+          git tag "$tag" "$GITHUB_SHA"
+          git push origin "refs/tags/$tag"
+          gh release create "$tag" --title "$tag" --generate-notes --verify-tag
+          echo "Tagged $tag. CircleCI will publish the Docker images."

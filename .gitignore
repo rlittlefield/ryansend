@@ -6,3 +6,5 @@ config.yaml
 .DS_Store
 licenses.html
 /data
+
+__pycache__/
