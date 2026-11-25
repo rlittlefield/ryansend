@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
-"""Opens security PRs for ryansend from a triage payload.
+"""Opens security release PRs for ryansend.
 
 Triage (cargo audit + Claude) runs in a separate private repository so its
-logs and analysis stay private. It dispatches the "Security advisories"
-workflow here with a JSON payload:
+logs and analysis stay private. When it finds an advisory it can't rule out
+and a lockfile update can fix, it dispatches the "Security advisories"
+workflow here with a payload like:
 
-  {"release": ["RUSTSEC-YYYY-NNNN", ...],
-   "ack": [{"id": "RUSTSEC-YYYY-NNNN", "confidence": "high",
-            "summary": "...", "reasoning": "...", "evidence": ["..."]}]}
+  {"release": ["RUSTSEC-YYYY-NNNN", ...]}
 
-The payload is untrusted. This script recomputes the advisory list with
-cargo audit, ignores IDs that aren't currently reported or already have an
-open bot PR, and can only ever:
-
-  - open a release PR: `cargo update -p <crate>` plus a patch version bump
-  - open an ack PR: ignore entries in .cargo/audit.toml and deny.toml
+The payload is untrusted. This script re-runs cargo audit, ignores IDs that
+aren't currently reported or already have an open bot PR, and can only ever
+open a release PR: `cargo update -p <crate>` plus a patch version bump.
 
 Logs stay generic because this repository's runs are public.
 
-Local dry run (builds branches in throwaway worktrees, pushes nothing):
+Local dry run (builds the branch in a throwaway worktree, pushes nothing):
 
-  SECURITY_BOT_PAYLOAD='{"release":["RUSTSEC-..."],"ack":[]}' \\
+  SECURITY_BOT_PAYLOAD='{"release":["RUSTSEC-..."]}' \\
     python3 .github/security-bot/bot.py --dry-run
 """
 
@@ -42,21 +38,15 @@ STATE = Path(
 
 LABEL_BOT = "security-bot"
 LABEL_RELEASE = "security-release"
-LABEL_ACK = "security-ack"
 LABELS = {
     LABEL_BOT: ("b60205", "Opened by the security advisory bot"),
     LABEL_RELEASE: ("d93f0b", "Security fix, merging ships a release"),
-    LABEL_ACK: ("0e8a16", "Advisory reviewed and ruled out, no release"),
 }
 
 BOT_NAME = "github-actions[bot]"
 BOT_EMAIL = "41898333+github-actions[bot]@users.noreply.github.com"
 ADVISORY_ID = re.compile(r"\bRUSTSEC-\d{4}-\d{4}\b")
 EXACT_ID = re.compile(r"^RUSTSEC-\d{4}-\d{4}$")
-CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f‪-‮⁦-⁩]")
-
-
-# ---------------------------------------------------------------- helpers
 
 
 def run(cmd, cwd=ROOT, check=True):
@@ -81,12 +71,7 @@ def audit(cwd=ROOT, fetch=True):
         if adv.get("withdrawn") or adv.get("informational"):
             continue
         entry = grouped.setdefault(adv["id"], {
-            "id": adv["id"],
-            "crate": adv["package"],
-            "title": adv["title"],
-            "patched": v["versions"].get("patched", []),
-            "packages": [],
-        })
+            "id": adv["id"], "crate": adv["package"], "packages": []})
         pkg = f"{v['package']['name']}@{v['package']['version']}"
         if pkg not in entry["packages"]:
             entry["packages"].append(pkg)
@@ -102,56 +87,13 @@ def tracked_ids():
     return ids
 
 
-def clean(text, limit):
-    """Make untrusted text safe to drop into markdown and TOML comments."""
-    text = CONTROL_CHARS.sub("", str(text))[:limit]
-    # Break @mentions. `crate@1.2.3` is left alone since GitHub only links
-    # an @ that follows a non-word character.
-    return re.sub(r"(?<![\w.])@(?=[A-Za-z0-9])", "@​", text)
-
-
 def parse_payload(raw):
-    """Validate the dispatched payload. Anything malformed is dropped."""
     try:
         data = json.loads(raw)
-        assert isinstance(data, dict)
+        assert isinstance(data, dict) and isinstance(data.get("release", []), list)
     except (json.JSONDecodeError, AssertionError):
-        raise SystemExit("payload is not a JSON object")
-
-    release = [i for i in data.get("release", []) if isinstance(i, str) and EXACT_ID.match(i)]
-    ack = []
-    for item in data.get("ack", []):
-        try:
-            assert EXACT_ID.match(item["id"])
-            assert item["confidence"] == "high"
-            evidence = item["evidence"]
-            assert isinstance(evidence, list) and evidence
-            ack.append({
-                "id": item["id"],
-                "summary": clean(item["summary"], 400).replace("\n", " "),
-                "reasoning": clean(item["reasoning"], 6000),
-                "evidence": [clean(e, 300).replace("\n", " ") for e in evidence[:30]],
-            })
-        except (AssertionError, KeyError, TypeError):
-            continue
-    ack = [a for a in ack if a["id"] not in release]
-    return release, ack
-
-
-# ---------------------------------------------------------------- git work
-
-
-def worktree(branch, base):
-    path = STATE / "worktrees" / branch.replace("/", "-")
-    if path.exists():
-        run(["git", "worktree", "remove", "--force", str(path)], check=False)
-    run(["git", "worktree", "add", "-B", branch, str(path), base])
-    return path
-
-
-def drop_worktree(path, branch):
-    run(["git", "worktree", "remove", "--force", str(path)], check=False)
-    run(["git", "branch", "-D", branch], check=False)
+        raise SystemExit("payload is not a valid JSON object")
+    return [i for i in data.get("release", []) if isinstance(i, str) and EXACT_ID.match(i)]
 
 
 def lock_versions(wt):
@@ -184,66 +126,17 @@ def bump_patch(wt):
     return new
 
 
-def insert_ignores(path, entries, header=""):
-    """Insert lines after `ignore = [` inside the [advisories] table."""
-    if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(header + "[advisories]\nignore = [\n]\n")
-    lines = path.read_text().splitlines(keepends=True)
-    in_adv = False
-    for i, line in enumerate(lines):
-        if re.match(r"^\s*\[", line):
-            in_adv = line.strip() == "[advisories]"
-        elif in_adv and re.match(r"^\s*ignore\s*=\s*\[\s*$", line):
-            lines[i + 1:i + 1] = [e + "\n" for e in entries]
-            path.write_text("".join(lines))
-            return
-    raise SystemExit(f"no multi-line `ignore = [` under [advisories] in {path}")
-
-
-def commit(wt, message):
-    run(["git", "add", "-A"], cwd=wt)
-    run(["git", "-c", f"user.name={BOT_NAME}", "-c", f"user.email={BOT_EMAIL}",
-         "commit", "-m", message], cwd=wt)
-
-
-def advisory_link(adv):
-    return f"[{adv['id']}](https://rustsec.org/advisories/{adv['id']}) (`{adv['crate']}`)"
-
-
-FOOTER = (
-    "\n---\nOpened by the security advisory bot "
-    "(`.github/workflows/security-advisories.yml`).\n"
-)
-
-
-def publish(wt, branch, title, body, labels, dry_run):
-    body_file = STATE / f"{branch.replace('/', '-')}.md"
-    body_file.write_text(body)
-    if dry_run:
-        print(f"\n===== [dry run] PR: {title}\nlabels: {', '.join(labels)}\n")
-        print(run(["git", "show", "--stat", "--patch", "HEAD"], cwd=wt).stdout)
-        print(body)
-        return
-    run(["git", "push", "--force", "origin", branch], cwd=wt)
-    cmd = ["gh", "pr", "create", "--base", "main", "--head", branch,
-           "--title", title, "--body-file", str(body_file)]
-    for label in labels:
-        cmd += ["--label", label]
-    print(run(cmd).stdout.strip())
-
-
-# ---------------------------------------------------------------- PRs
-
-
-def act_release(advs, base, run_id, dry_run):
-    """Returns the number of advisories the lockfile update could not fix."""
+def release(advs, base, dry_run):
+    """Open the release PR. Returns how many advisories couldn't be fixed."""
+    run_id = os.environ.get("GITHUB_RUN_ID") or time.strftime("%Y%m%d%H%M%S")
     branch = f"hotfix/security-{run_id}-release"
-    wt = worktree(branch, base)
-    unfixed = 0
+    wt = STATE / "worktrees" / branch.replace("/", "-")
+    if wt.exists():
+        run(["git", "worktree", "remove", "--force", str(wt)], check=False)
+    run(["git", "worktree", "add", "-B", branch, str(wt), base])
     try:
         before = lock_versions(wt)
-        fixed = []
+        fixed, unfixed = [], 0
         for adv in advs:
             snapshot = (wt / "Cargo.lock").read_text()
             # Plain -p first for the smallest change. --recursive also unlocks
@@ -264,73 +157,40 @@ def act_release(advs, base, run_id, dry_run):
         run(["cargo", "update", "--workspace"], cwd=wt)
         changes = lock_changes(before, lock_versions(wt))
         ids = ", ".join(a["id"] for a in fixed)
-        commit(wt, f"fix(deps): security update {version}\n\nAddresses {ids}.")
+        run(["git", "add", "-A"], cwd=wt)
+        run(["git", "-c", f"user.name={BOT_NAME}", "-c", f"user.email={BOT_EMAIL}",
+             "commit", "-m", f"fix(deps): security update {version}\n\nAddresses {ids}."],
+            cwd=wt)
 
         # Deliberately neutral: no reachability analysis in public.
+        title = f"Dependency security update v{version}"
         body = (
-            f"## Dependency security update v{version}\n\n"
+            f"## {title}\n\n"
             "Updates dependencies that have published security advisories. "
-            f"Merging this PR tags `v{version}`, which publishes the Docker "
-            "images through CircleCI.\n\n"
-            "Advisories:\n\n" + "\n".join(f"- {advisory_link(a)}" for a in fixed) + "\n\n"
-            "Lockfile changes:\n\n" + "\n".join(f"- {c}" for c in changes) + "\n"
-            + FOOTER
+            f"Merging this PR tags `v{version}`, which publishes the Docker images "
+            "through CircleCI.\n\nAdvisories:\n\n"
+            + "\n".join(f"- [{a['id']}](https://rustsec.org/advisories/{a['id']}) "
+                        f"(`{a['crate']}`)" for a in fixed)
+            + "\n\nLockfile changes:\n\n" + "\n".join(f"- {c}" for c in changes)
+            + "\n\n---\nOpened by the security advisory bot "
+              "(`.github/workflows/security-advisories.yml`).\n"
         )
-        publish(wt, branch, f"Dependency security update v{version}",
-                body, [LABEL_BOT, LABEL_RELEASE], dry_run)
+        body_file = STATE / "pr-body.md"
+        body_file.write_text(body)
+        if dry_run:
+            print(f"\n===== [dry run] PR: {title}\n")
+            print(run(["git", "show", "--stat", "HEAD"], cwd=wt).stdout)
+            print(body)
+        else:
+            run(["git", "push", "--force", "origin", branch], cwd=wt)
+            print(run(["gh", "pr", "create", "--base", "main", "--head", branch,
+                       "--title", title, "--body-file", str(body_file),
+                       "--label", LABEL_BOT, "--label", LABEL_RELEASE]).stdout.strip())
         return unfixed
     finally:
         if dry_run:
-            drop_worktree(wt, branch)
-
-
-def ack_block(adv, t):
-    ev = "\n".join(f"- {e}" for e in t["evidence"])
-    return (
-        f"### {adv['id']}: {clean(adv['title'], 200)}\n\n"
-        f"Crate `{adv['crate']}` · patched {', '.join(adv['patched']) or 'none'} · "
-        f"[advisory](https://rustsec.org/advisories/{adv['id']})\n\n"
-        f"**Triage: ruled out** (high confidence). {t['summary']}\n\n"
-        f"<details><summary>Analysis</summary>\n\n{t['reasoning']}\n\n"
-        f"**Evidence**\n\n{ev}\n\n</details>\n"
-    )
-
-
-def act_ack(advs, triage, base, run_id, dry_run):
-    branch = f"hotfix/security-{run_id}-ack"
-    wt = worktree(branch, base)
-    try:
-        audit_lines, deny_lines = [], []
-        for adv in advs:
-            reason = f"{adv['crate']}: ruled out by triage. {triage[adv['id']]['summary']}"
-            audit_lines.append(f'    "{adv["id"]}", # {reason}')
-            deny_lines.append(f'    {{ id = "{adv["id"]}", reason = {json.dumps(reason)} }},')
-        insert_ignores(
-            wt / ".cargo" / "audit.toml", audit_lines,
-            header="# Advisories reviewed and ruled out for ryansend.\n"
-                   "# Added by .github/security-bot. The PR that added each entry has the analysis.\n",
-        )
-        insert_ignores(wt / "deny.toml", deny_lines)
-        ids = ", ".join(a["id"] for a in advs)
-        commit(wt, f"chore(security): record {ids} as not affecting ryansend")
-
-        body = (
-            "## Advisories ruled out\n\n"
-            "Merging this PR adds these advisories to the ignore lists in "
-            "`.cargo/audit.toml` and `deny.toml` so CI stays green. No dependency "
-            "changes and no release. If you disagree with the analysis, close this "
-            "PR and the bot will propose a release on its next run.\n\n"
-            + "\n".join(ack_block(a, triage[a["id"]]) for a in advs)
-            + "\nThe triage was written by Claude from the advisory, our source and "
-              "the locked dependency sources. Check it before merging.\n"
-            + FOOTER
-        )
-        crates = ", ".join(sorted({a["crate"] for a in advs}))
-        publish(wt, branch, f"Advisories ruled out: {crates} ({ids})",
-                body, [LABEL_BOT, LABEL_ACK], dry_run)
-    finally:
-        if dry_run:
-            drop_worktree(wt, branch)
+            run(["git", "worktree", "remove", "--force", str(wt)], check=False)
+            run(["git", "branch", "-D", branch], check=False)
 
 
 def main():
@@ -339,17 +199,14 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    release_ids, ack_items = parse_payload(os.environ.get("SECURITY_BOT_PAYLOAD", ""))
+    requested = parse_payload(os.environ.get("SECURITY_BOT_PAYLOAD", ""))
     found = audit(fetch=True)
     skip = tracked_ids()
     if args.dry_run and skip:
         print(f"[dry run] not skipping IDs with open bot PRs: {', '.join(sorted(skip))}")
         skip = set()
-
-    release = [found[i] for i in release_ids if i in found and i not in skip]
-    ack = [found[a["id"]] for a in ack_items if a["id"] in found and a["id"] not in skip]
-    triage = {a["id"]: a for a in ack_items}
-    if not release and not ack:
+    advs = [found[i] for i in requested if i in found and i not in skip]
+    if not advs:
         print("Nothing to do.")
         return
 
@@ -363,11 +220,7 @@ def main():
             run(["gh", "label", "create", name, "--color", color,
                  "--description", desc, "--force"])
 
-    run_id = os.environ.get("GITHUB_RUN_ID") or time.strftime("%Y%m%d%H%M%S")
-    unfixed = act_release(release, base, run_id, args.dry_run) if release else 0
-    if ack:
-        act_ack(ack, triage, base, run_id, args.dry_run)
-    if unfixed:
+    if release(advs, base, args.dry_run):
         # Generic on purpose: this log is public.
         raise SystemExit("Some requested updates could not be applied. "
                          "Details are in the private triage repository.")
