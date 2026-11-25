@@ -31,8 +31,21 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Prebuilt release binary, checked against a pinned SHA-256, instead of
+      # compiling from source (about 3 minutes). To upgrade, update both values.
       - name: Install cargo-audit
-        run: cargo install --locked cargo-audit
+        env:
+          VERSION: v0.22.2
+          SHA256: 7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428
+        run: |
+          set -euo pipefail
+          name="cargo-audit-x86_64-unknown-linux-musl-$VERSION"
+          curl -fsSL -o "$RUNNER_TEMP/$name.tgz" \
+            "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2F$VERSION/$name.tgz"
+          echo "$SHA256  $RUNNER_TEMP/$name.tgz" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/$name.tgz" -C "$RUNNER_TEMP"
+          install -m 755 "$RUNNER_TEMP/$name/cargo-audit" "$HOME/.cargo/bin/cargo-audit"
+          cargo audit --version
 
       # The payload goes through an env var, never into the script text,
       # and bot.py validates it against a fresh cargo audit.
