@@ -84,9 +84,9 @@ impl Config {
 
         if let Some(le_config) = &self.lets_encrypt {
             if let Some(expiry_str) = &le_config.expiry {
-                if let Ok(expiry) = chrono::DateTime::parse_from_rfc3339(expiry_str) {
-                    let now = chrono::Utc::now();
-                    let days_until_expiry = (expiry.with_timezone(&chrono::Utc) - now).num_days();
+                if let Ok(expiry) = expiry_str.parse::<jiff::Timestamp>() {
+                    let now = jiff::Timestamp::now();
+                    let days_until_expiry = expiry.duration_since(now).as_secs() / 86_400;
                     return days_until_expiry < 30;
                 }
             }
@@ -686,9 +686,9 @@ remove_kofi: false
 
     #[test]
     fn test_cert_renewal_needed() {
-        let now = chrono::Utc::now();
-        let future_expiry = now + chrono::Duration::days(31); // More than 30 days, no renewal needed
-        let near_expiry = now + chrono::Duration::days(10); // Less than 30 days, renewal needed
+        let now = jiff::Timestamp::now();
+        let future_expiry = now + jiff::SignedDuration::from_hours(31 * 24); // More than 30 days, no renewal needed
+        let near_expiry = now + jiff::SignedDuration::from_hours(10 * 24); // Less than 30 days, renewal needed
 
         let config_future = Config {
             base_url: "https://example.com".to_string(),
@@ -703,7 +703,7 @@ remove_kofi: false
             lets_encrypt: Some(LetsEncryptConfig {
                 cert: Some("cert-data".to_string()),
                 key: Some("key-data".to_string()),
-                expiry: Some(future_expiry.to_rfc3339()),
+                expiry: Some(future_expiry.to_string()),
                 acme_email: None,
             }),
         };
@@ -723,7 +723,7 @@ remove_kofi: false
             lets_encrypt: Some(LetsEncryptConfig {
                 cert: Some("cert-data".to_string()),
                 key: Some("key-data".to_string()),
-                expiry: Some(near_expiry.to_rfc3339()),
+                expiry: Some(near_expiry.to_string()),
                 acme_email: None,
             }),
         };

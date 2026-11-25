@@ -10,8 +10,8 @@ use axum::{
     Router,
 };
 use axum_extra::extract::{cookie::Cookie, CookieJar};
-use chrono::{Duration, Utc};
 use fast_glob::glob_match;
+use jiff::{SignedDuration, Timestamp};
 use log::{error, info};
 
 use rusty_paseto::prelude::*;
@@ -257,8 +257,8 @@ async fn admin_login_handler(
     }
 
     // Generate admin token
-    let now = Utc::now();
-    let exp = now + Duration::hours(24);
+    let now = Timestamp::now();
+    let exp = now + SignedDuration::from_hours(24);
 
     let claims = AdminTokenClaims {
         user: "admin".to_string(),
@@ -272,7 +272,7 @@ async fn admin_login_handler(
 
     let token = match PasetoBuilder::<V4, Local>::default()
         .set_claim(
-            ExpirationClaim::try_from(claims.exp.to_rfc3339())
+            ExpirationClaim::try_from(claims.exp.to_string())
                 .expect("Failed to convert expiration claim to RFC3339"),
         )
         .set_claim(

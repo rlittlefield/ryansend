@@ -133,7 +133,7 @@ pub async fn save_cert_to_config(
     config: &mut Config,
     cert_pem: &str,
     key_pem: &str,
-    expiry: chrono::DateTime<chrono::Utc>,
+    expiry: jiff::Timestamp,
 ) -> Result<()> {
     // Encode to base64
     let cert_b64 = general_purpose::STANDARD.encode(cert_pem.as_bytes());
@@ -143,12 +143,12 @@ pub async fn save_cert_to_config(
     if let Some(le_config) = &mut config.lets_encrypt {
         le_config.cert = Some(cert_b64);
         le_config.key = Some(key_b64);
-        le_config.expiry = Some(expiry.to_rfc3339());
+        le_config.expiry = Some(expiry.to_string());
     } else {
         config.lets_encrypt = Some(crate::config::LetsEncryptConfig {
             cert: Some(cert_b64),
             key: Some(key_b64),
-            expiry: Some(expiry.to_rfc3339()),
+            expiry: Some(expiry.to_string()),
             acme_email: config
                 .lets_encrypt
                 .as_ref()
@@ -240,7 +240,7 @@ pub async fn request_letsencrypt_cert(
     use_staging: bool,
     contact_email: &str,
     acme_account_file: &str,
-) -> Result<(String, String, chrono::DateTime<chrono::Utc>)> {
+) -> Result<(String, String, jiff::Timestamp)> {
     info!("═══════════════════════════════════════════════════════════════");
     info!("🔐 Starting Let's Encrypt ACME Certificate Request");
     info!("═══════════════════════════════════════════════════════════════");
@@ -262,7 +262,7 @@ pub async fn request_letsencrypt_cert(
         warn!("⚠️  Falling back to self-signed certificate");
         info!("📝 Self-signed certificates are only for development/testing");
         let (cert_pem, key_pem) = generate_self_signed_cert(domain)?;
-        let expiry = chrono::Utc::now() + chrono::Duration::days(365);
+        let expiry = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(365 * 24);
         return Ok((cert_pem, key_pem, expiry));
     }
 
@@ -278,7 +278,7 @@ pub async fn request_letsencrypt_cert(
             error!("❌ Failed to get/create ACME account: {}", e);
             warn!("⚠️  Falling back to self-signed certificate");
             let (cert_pem, key_pem) = generate_self_signed_cert(domain)?;
-            let expiry = chrono::Utc::now() + chrono::Duration::days(365);
+            let expiry = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(365 * 24);
             return Ok((cert_pem, key_pem, expiry));
         }
     };
@@ -373,7 +373,7 @@ pub async fn request_letsencrypt_cert(
     // Step 8: Parse expiry from certificate
     info!("───────────────────────────────────────────────────────────────");
     info!("Step 8/8: Certificate obtained successfully!");
-    let expiry = chrono::Utc::now() + chrono::Duration::days(90); // Let's Encrypt certs valid for 90 days
+    let expiry = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(90 * 24); // Let's Encrypt certs valid for 90 days
 
     info!("═══════════════════════════════════════════════════════════════");
     info!("✅ Let's Encrypt Certificate Request Complete!");
@@ -544,7 +544,7 @@ mod tests {
         config.lets_encrypt = Some(crate::config::LetsEncryptConfig {
             cert: Some(base64::engine::general_purpose::STANDARD.encode(cert_pem.as_bytes())),
             key: Some(base64::engine::general_purpose::STANDARD.encode(key_pem.as_bytes())),
-            expiry: Some(chrono::Utc::now().to_rfc3339()),
+            expiry: Some(jiff::Timestamp::now().to_string()),
             acme_email: None,
         });
 
@@ -582,8 +582,8 @@ mod tests {
 
         // Create a config with an expired certificate
         let (cert_pem, key_pem) = generate_self_signed_cert("test.example.com").unwrap();
-        let expired_time = chrono::Utc::now() - chrono::Duration::days(1); // Already expired
-        let near_expiry_time = chrono::Utc::now() + chrono::Duration::hours(24); // Expires in 24 hours
+        let expired_time = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24); // Already expired
+        let near_expiry_time = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24); // Expires in 24 hours
 
         let config_expired = Config {
             base_url: "https://test.example.com".to_string(),
@@ -598,14 +598,14 @@ mod tests {
             lets_encrypt: Some(crate::config::LetsEncryptConfig {
                 cert: Some(base64::engine::general_purpose::STANDARD.encode(cert_pem.as_bytes())),
                 key: Some(base64::engine::general_purpose::STANDARD.encode(key_pem.as_bytes())),
-                expiry: Some(expired_time.to_rfc3339()),
+                expiry: Some(expired_time.to_string()),
                 acme_email: None,
             }),
         };
 
         let mut config_near_expiry = config_expired.clone();
         if let Some(ref mut le_config) = config_near_expiry.lets_encrypt {
-            le_config.expiry = Some(near_expiry_time.to_rfc3339());
+            le_config.expiry = Some(near_expiry_time.to_string());
         }
 
         // Test that expired certificate is detected as needing renewal
@@ -643,7 +643,7 @@ mod tests {
         assert!(key_pem.starts_with("-----BEGIN PRIVATE KEY-----"));
 
         // Verify expiry is in the future
-        assert!(expiry > chrono::Utc::now());
+        assert!(expiry > jiff::Timestamp::now());
 
         // Verify we can parse the certificate
         let tls_cert = parse_cert_and_key(&cert_pem, &key_pem);

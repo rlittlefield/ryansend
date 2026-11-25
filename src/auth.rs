@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use log::info;
 use rand::{rng, RngExt};
 use rusty_paseto::prelude::*;
@@ -18,7 +18,7 @@ pub enum TokenSource {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TokenClaims {
     pub path: String,
-    pub exp: DateTime<Utc>,
+    pub exp: Timestamp,
     pub id: String,
     pub max_uses: Option<u32>,
     pub note: Option<String>,
@@ -33,7 +33,7 @@ fn default_source() -> TokenSource {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AdminTokenClaims {
     pub user: String,
-    pub exp: DateTime<Utc>,
+    pub exp: Timestamp,
 }
 
 pub async fn generate_token(
@@ -56,8 +56,8 @@ pub async fn generate_token_with_options(
         return Err(anyhow!("File does not exist: {}", file_path.display()));
     }
 
-    let now = Utc::now();
-    let exp = now + Duration::seconds(expires_in_seconds as i64);
+    let now = Timestamp::now();
+    let exp = now + SignedDuration::from_secs(expires_in_seconds as i64);
 
     // Generate unique 8-byte (16 character hex) ID
     let mut id_bytes = [0u8; 8];
@@ -85,7 +85,7 @@ pub async fn generate_token_with_options(
 
     let token = if let (Some(max_uses), Some(ref note)) = (max_uses, &claims.note) {
         PasetoBuilder::<V4, Local>::default()
-            .set_claim(ExpirationClaim::try_from(claims.exp.to_rfc3339())?)
+            .set_claim(ExpirationClaim::try_from(claims.exp.to_string())?)
             .set_claim(CustomClaim::try_from(("path", claims.path.clone()))?)
             .set_claim(CustomClaim::try_from(("id", claims.id.clone()))?)
             .set_claim(CustomClaim::try_from(("max_uses", max_uses.to_string()))?)
@@ -94,7 +94,7 @@ pub async fn generate_token_with_options(
             .build(&key)?
     } else if let Some(max_uses) = max_uses {
         PasetoBuilder::<V4, Local>::default()
-            .set_claim(ExpirationClaim::try_from(claims.exp.to_rfc3339())?)
+            .set_claim(ExpirationClaim::try_from(claims.exp.to_string())?)
             .set_claim(CustomClaim::try_from(("path", claims.path.clone()))?)
             .set_claim(CustomClaim::try_from(("id", claims.id.clone()))?)
             .set_claim(CustomClaim::try_from(("max_uses", max_uses.to_string()))?)
@@ -102,7 +102,7 @@ pub async fn generate_token_with_options(
             .build(&key)?
     } else if let Some(ref note) = claims.note {
         PasetoBuilder::<V4, Local>::default()
-            .set_claim(ExpirationClaim::try_from(claims.exp.to_rfc3339())?)
+            .set_claim(ExpirationClaim::try_from(claims.exp.to_string())?)
             .set_claim(CustomClaim::try_from(("path", claims.path.clone()))?)
             .set_claim(CustomClaim::try_from(("id", claims.id.clone()))?)
             .set_claim(CustomClaim::try_from(("note", note.clone()))?)
@@ -110,7 +110,7 @@ pub async fn generate_token_with_options(
             .build(&key)?
     } else {
         PasetoBuilder::<V4, Local>::default()
-            .set_claim(ExpirationClaim::try_from(claims.exp.to_rfc3339())?)
+            .set_claim(ExpirationClaim::try_from(claims.exp.to_string())?)
             .set_claim(CustomClaim::try_from(("path", claims.path.clone()))?)
             .set_claim(CustomClaim::try_from(("id", claims.id.clone()))?)
             .set_claim(CustomClaim::try_from(("source", source_str))?)
@@ -205,9 +205,9 @@ pub async fn verify_token_and_get_claims(secret_key: &str, token: &str) -> Resul
         .as_str()
         .ok_or_else(|| anyhow!("Missing or invalid exp claim"))?;
 
-    let exp = DateTime::parse_from_rfc3339(exp_str)
-        .map_err(|e| anyhow!("Invalid expiration format: {}", e))?
-        .with_timezone(&Utc);
+    let exp: Timestamp = exp_str
+        .parse()
+        .map_err(|e| anyhow!("Invalid expiration format: {}", e))?;
 
     let max_uses = parsed_token["max_uses"]
         .as_str()
@@ -262,8 +262,8 @@ pub async fn generate_tunnel_token(
     file_size: u64,
     expires_in_seconds: u64,
 ) -> Result<String> {
-    let now = Utc::now();
-    let exp = now + Duration::seconds(expires_in_seconds as i64);
+    let now = Timestamp::now();
+    let exp = now + SignedDuration::from_secs(expires_in_seconds as i64);
 
     let claims = TokenClaims {
         path: file_name.clone(),
@@ -280,7 +280,7 @@ pub async fn generate_tunnel_token(
 
     // Build PASETO token with claims
     let token = PasetoBuilder::<V4, Local>::default()
-        .set_claim(ExpirationClaim::try_from(claims.exp.to_rfc3339())?)
+        .set_claim(ExpirationClaim::try_from(claims.exp.to_string())?)
         .set_claim(CustomClaim::try_from(("path", claims.path.clone()))?)
         .set_claim(CustomClaim::try_from(("id", claims.id.clone()))?)
         .set_claim(CustomClaim::try_from((
