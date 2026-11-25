@@ -30,7 +30,7 @@ use crate::tunnel::{TunnelFileInfo, TunnelManager};
 use crate::ReloadSignal;
 
 use async_zip::tokio::write::ZipFileWriter;
-use async_zip::{Compression, ZipDateTime, ZipEntryBuilder};
+use async_zip::{Compression, ZipDateTime, ZipDateTimeBuilder, ZipEntryBuilder};
 use futures::AsyncWriteExt as FuturesAsyncWriteExt;
 
 #[derive(Debug, Clone)]
@@ -585,20 +585,24 @@ async fn open_within_root(path: &FsPath, root: &FsPath) -> Option<fs::File> {
 
 /// ZIP timestamps are local time with a representable range of 1980 to 2107.
 fn zip_timestamp(time: std::time::SystemTime) -> ZipDateTime {
-    use chrono::Datelike;
-    let local = chrono::DateTime::<chrono::Local>::from(time).naive_local();
-    let clamped = if local.year() < 1980 {
-        chrono::NaiveDate::from_ymd_opt(1980, 1, 1)
-            .and_then(|d| d.and_hms_opt(0, 0, 0))
-            .unwrap_or(local)
-    } else if local.year() > 2107 {
-        chrono::NaiveDate::from_ymd_opt(2107, 12, 31)
-            .and_then(|d| d.and_hms_opt(23, 59, 58))
-            .unwrap_or(local)
-    } else {
-        local
+    use jiff::civil::{datetime, DateTime};
+    const MIN: DateTime = datetime(1980, 1, 1, 0, 0, 0, 0);
+    const MAX: DateTime = datetime(2107, 12, 31, 23, 59, 58, 0);
+    // Only fails for times outside jiff's supported range, far past either ZIP bound.
+    let local = match jiff::ZonedDateTime::try_from(time) {
+        Ok(zoned) => zoned.datetime(),
+        Err(_) if time < std::time::UNIX_EPOCH => MIN,
+        Err(_) => MAX,
     };
-    ZipDateTime::from_chrono(&clamped.and_utc())
+    let clamped = local.clamp(MIN, MAX);
+    ZipDateTimeBuilder::new()
+        .year(clamped.year().into())
+        .month(clamped.month().unsigned_abs().into())
+        .day(clamped.day().unsigned_abs().into())
+        .hour(clamped.hour().unsigned_abs().into())
+        .minute(clamped.minute().unsigned_abs().into())
+        .second(clamped.second().unsigned_abs().into())
+        .build()
 }
 
 /// Responds with a streaming ZIP of the directory a filesystem share token points at.
@@ -704,9 +708,12 @@ pub async fn download_handler(
         }
 
         // Calculate duration until one minute past token expiration
-        let now = chrono::Utc::now();
-        let track_until = claims.exp + chrono::Duration::minutes(1);
-        let duration_secs = (track_until - now).num_seconds().max(0) as u64;
+        let duration_secs = claims
+            .exp
+            .duration_since(jiff::Timestamp::now())
+            .as_secs()
+            .saturating_add(60)
+            .max(0) as u64;
 
         // Update usage count
         tracker.insert(
@@ -1236,7 +1243,7 @@ mod directory_zip_tests {
         let missing = tempfile::tempdir().unwrap().path().join("gone");
         let claims = crate::auth::TokenClaims {
             path: missing.to_string_lossy().to_string(),
-            exp: chrono::Utc::now() + chrono::Duration::minutes(5),
+            exp: jiff::Timestamp::now() + jiff::SignedDuration::from_mins(5),
             id: "test".to_string(),
             max_uses: None,
             note: None,
@@ -1254,13 +1261,12 @@ mod directory_zip_tests {
 
     #[test]
     fn timestamps_outside_zip_range_are_clamped() {
-        use chrono::TimeZone;
         let epoch = zip_timestamp(std::time::UNIX_EPOCH);
         assert_eq!(epoch.year(), 1980);
-        let modern = chrono::Local
-            .with_ymd_and_hms(2024, 6, 1, 12, 30, 10)
+        let modern = jiff::civil::datetime(2024, 6, 1, 12, 30, 10, 0)
+            .to_zoned_datetime(jiff::tz::TimeZone::system())
             .unwrap();
-        let ts = zip_timestamp(modern.into());
+        let ts = zip_timestamp(modern.try_into().unwrap());
         assert_eq!((ts.year(), ts.month(), ts.day()), (2024, 6, 1));
         assert_eq!((ts.hour(), ts.minute(), ts.second()), (12, 30, 10));
     }
