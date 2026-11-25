@@ -1,0 +1,7 @@
+# Advisories reviewed and ruled out for ryansend.
+# Added by .github/security-bot. The PR that added each entry has the analysis.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0592", # url: ruled out by triage. The vulnerable `Url::origin()` / `url::quirks::origin()` are compiled in but never called, either by ryansend or by the crates that depend on url (reqwest 0.13.5, tower-http 0.6.11).
+    "RUSTSEC-2026-0594", # cookie: ruled out by triage. cookie 0.18.2 is built without its `private` feature, so `PrivateJar`, the only code affected by the nonce-reuse bug, is not compiled into ryansend.
+]
