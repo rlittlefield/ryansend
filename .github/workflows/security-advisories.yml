@@ -1,0 +1,95 @@
+# Daily RustSec check. Opens a release PR only for advisories Claude can't
+# rule out, and an ack PR (no release) for the ones it can.
+# Setup and behavior: .github/security-bot/README.md
+#
+# Isolation: Claude runs in the `triage` job, which has a read-only token and
+# read-only tools. The `act` job holds the write token, never runs Claude,
+# recomputes the advisory list itself and treats triage.json as untrusted.
+name: Security advisories
+
+on:
+  schedule:
+    - cron: "23 14 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: security-advisories
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    outputs:
+      pending: ${{ steps.scan.outputs.pending }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      - name: Scan for new advisories
+        id: scan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/security-bot/bot.py scan
+
+      - name: Install Claude Code
+        if: steps.scan.outputs.pending == 'true'
+        run: npm install -g @anthropic-ai/claude-code@2.1.332
+
+      # Only the Anthropic credential is in scope here. Set one of the two
+      # repository secrets (Settings > Secrets and variables > Actions).
+      - name: Triage with Claude
+        if: steps.scan.outputs.pending == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: python3 .github/security-bot/bot.py triage
+
+      - name: Upload triage results
+        if: steps.scan.outputs.pending == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: triage
+          path: ${{ runner.temp }}/security-bot/triage.json
+          retention-days: 7
+
+  act:
+    needs: triage
+    if: needs.triage.outputs.pending == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download triage results
+        uses: actions/download-artifact@v4
+        with:
+          name: triage
+          path: ${{ runner.temp }}/security-bot
+
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      - name: Open PRs and issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh auth setup-git
+          python3 .github/security-bot/bot.py act

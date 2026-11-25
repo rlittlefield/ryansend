@@ -225,7 +225,7 @@ jobs:
             docker push $TAG_NAME
 
             # Tag and push additional tags
-            if [ "$CIRCLE_BRANCH" = "main" ]; then
+            if [ "$CIRCLE_BRANCH" = "main" ] || [ -n "$CIRCLE_TAG" ]; then
               docker tag $TAG_NAME $DOCKER_USERNAME/ryansend:latest-amd64
               docker push $DOCKER_USERNAME/ryansend:latest-amd64
             fi
@@ -307,7 +307,7 @@ jobs:
             docker push $TAG_NAME
 
             # Tag and push additional tags
-            if [ "$CIRCLE_BRANCH" = "main" ]; then
+            if [ "$CIRCLE_BRANCH" = "main" ] || [ -n "$CIRCLE_TAG" ]; then
               docker tag $TAG_NAME $DOCKER_USERNAME/ryansend:latest-arm64
               docker push $DOCKER_USERNAME/ryansend:latest-arm64
             fi
@@ -333,6 +333,30 @@ jobs:
             echo "**Git SHA:** $CIRCLE_SHA1"
             echo "**Platform:** linux/arm64"
             echo "**Runner:** arm64 (large)"
+
+  # Publishing only happens for tags on commits already merged to main whose
+  # Cargo.toml version matches the tag. Runs without the docker-hub-creds context.
+  verify-release-tag:
+    docker:
+      - image: cimg/base:current
+    resource_class: small
+    steps:
+      - checkout
+      - run:
+          name: Check the tag is on main and matches Cargo.toml
+          command: |
+            set -eu
+            git fetch --no-tags origin main
+            if ! git merge-base --is-ancestor "$CIRCLE_SHA1" FETCH_HEAD; then
+              echo "Refusing to publish: $CIRCLE_TAG ($CIRCLE_SHA1) is not on main."
+              exit 1
+            fi
+            VERSION=$(sed -n 's/^version = "\([0-9.]*\)"$/\1/p' Cargo.toml | head -n 1)
+            if [ "v$VERSION" != "$CIRCLE_TAG" ]; then
+              echo "Refusing to publish: tag $CIRCLE_TAG does not match Cargo.toml version $VERSION."
+              exit 1
+            fi
+            echo "$CIRCLE_TAG is on main and matches Cargo.toml."
 
   create-multiarch-manifest:
     docker:
@@ -369,7 +393,7 @@ jobs:
             docker manifest push $DOCKER_USERNAME/ryansend:$CARGO_VERSION
 
             # Create latest manifest if on main branch
-            if [ "$CIRCLE_BRANCH" = "main" ]; then
+            if [ "$CIRCLE_BRANCH" = "main" ] || [ -n "$CIRCLE_TAG" ]; then
               docker manifest create --amend $DOCKER_USERNAME/ryansend:latest \
                 $DOCKER_USERNAME/ryansend:latest-amd64 \
                 $DOCKER_USERNAME/ryansend:latest-arm64
@@ -405,7 +429,7 @@ jobs:
             echo ""
             echo "**Published Images:**"
             echo "- $DOCKER_USERNAME/ryansend:$CARGO_VERSION (multi-arch)"
-            if [ "$CIRCLE_BRANCH" = "main" ]; then
+            if [ "$CIRCLE_BRANCH" = "main" ] || [ -n "$CIRCLE_TAG" ]; then
               echo "- $DOCKER_USERNAME/ryansend:latest (multi-arch)"
             fi
             if [ ! -z "$CIRCLE_TAG" ]; then
@@ -420,7 +444,7 @@ jobs:
             echo "**Pull Commands:**"
             echo '```bash'
             echo "docker pull $DOCKER_USERNAME/ryansend:$CARGO_VERSION"
-            if [ "$CIRCLE_BRANCH" = "main" ]; then
+            if [ "$CIRCLE_BRANCH" = "main" ] || [ -n "$CIRCLE_TAG" ]; then
               echo "docker pull $DOCKER_USERNAME/ryansend:latest"
             fi
             echo '```'
@@ -466,9 +490,18 @@ workflows:
   # Docker publish workflow (runs on version tags)
   docker-publish:
     jobs:
+      - verify-release-tag:
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /^v\d+\.\d+\.\d+$/
+
       - build-amd64-docker:
           context:
             - docker-hub-creds
+          requires:
+            - verify-release-tag
           filters:
             branches:
               ignore: /.*/
@@ -478,6 +511,8 @@ workflows:
       - build-arm64-docker:
           context:
             - docker-hub-creds
+          requires:
+            - verify-release-tag
           filters:
             branches:
               ignore: /.*/
